@@ -57,6 +57,7 @@ class WeatherCondition(str, Enum):
     """Weather condition types."""
     SUNNY = "sunny"
     CLOUDY = "cloudy"
+    PARTLY_CLOUDY = "partly_cloudy"
     RAINY = "rainy"
     SNOWY = "snowy"
     STORMY = "stormy"

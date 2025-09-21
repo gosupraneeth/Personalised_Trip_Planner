@@ -6,10 +6,11 @@ POIs, weather data, and transport information.
 """
 
 import logging
-from typing import Dict, Any, Optional, List
-from datetime import date, timedelta
+from typing import Dict, Any, Optional, List, Tuple
+from datetime import date, timedelta, datetime, time
 from decimal import Decimal
 import uuid
+import math
 from adk import LlmAgent
 from google.cloud import aiplatform
 
@@ -41,6 +42,79 @@ class ItineraryPlannerAgent(LlmAgent):
         )
         
         logger.info("Itinerary Planner Agent initialized")
+    
+    def _get_destination_currency(self, destination: str) -> Tuple[str, str, float]:
+        """
+        Get currency info for destination.
+        
+        Returns:
+            Tuple of (currency_code, currency_symbol, usd_to_local_rate)
+        """
+        # Currency mapping for major destinations
+        currency_mapping = {
+            # India
+            "bangalore": ("INR", "₹", 83.0),
+            "mumbai": ("INR", "₹", 83.0),
+            "delhi": ("INR", "₹", 83.0),
+            "chennai": ("INR", "₹", 83.0),
+            "hyderabad": ("INR", "₹", 83.0),
+            "pune": ("INR", "₹", 83.0),
+            "kolkata": ("INR", "₹", 83.0),
+            "india": ("INR", "₹", 83.0),
+            
+            # Europe
+            "paris": ("EUR", "€", 0.92),
+            "london": ("GBP", "£", 0.79),
+            "rome": ("EUR", "€", 0.92),
+            "barcelona": ("EUR", "€", 0.92),
+            "amsterdam": ("EUR", "€", 0.92),
+            "berlin": ("EUR", "€", 0.92),
+            
+            # Asia
+            "tokyo": ("JPY", "¥", 149.0),
+            "singapore": ("SGD", "S$", 1.35),
+            "bangkok": ("THB", "฿", 36.0),
+            "kuala lumpur": ("MYR", "RM", 4.7),
+            "dubai": ("AED", "د.إ", 3.67),
+            
+            # North America
+            "new york": ("USD", "$", 1.0),
+            "los angeles": ("USD", "$", 1.0),
+            "toronto": ("CAD", "C$", 1.36),
+            "vancouver": ("CAD", "C$", 1.36),
+            
+            # Others
+            "sydney": ("AUD", "A$", 1.52),
+            "melbourne": ("AUD", "A$", 1.52),
+        }
+        
+        destination_lower = destination.lower()
+        
+        # Try exact match first
+        if destination_lower in currency_mapping:
+            return currency_mapping[destination_lower]
+        
+        # Try partial matches for countries/regions
+        for key, value in currency_mapping.items():
+            if key in destination_lower or destination_lower in key:
+                return value
+        
+        # Default to USD
+        return ("USD", "$", 1.0)
+    
+    def _format_currency(self, amount: Decimal, destination: str) -> str:
+        """Format currency amount based on destination."""
+        currency_code, symbol, rate = self._get_destination_currency(destination)
+        local_amount = float(amount) * rate
+        
+        if currency_code == "JPY":
+            # No decimal places for JPY
+            return f"{symbol}{int(local_amount)}"
+        elif currency_code == "INR":
+            # Indian number formatting with commas
+            return f"{symbol}{local_amount:,.0f}"
+        else:
+            return f"{symbol}{local_amount:.2f}"
     
     def create_itinerary(
         self,
@@ -142,7 +216,8 @@ class ItineraryPlannerAgent(LlmAgent):
                 # Update transport information
                 updated_items = self._update_transport_info(
                     optimized_items,
-                    maps_tool
+                    maps_tool,
+                    itinerary.trip_request.destination
                 )
                 
                 # Create updated day plan
@@ -227,6 +302,10 @@ class ItineraryPlannerAgent(LlmAgent):
                 notes=self._generate_day_notes(day_weather, day_pois)
             )
             
+            # Validate the daily schedule
+            if not self._validate_daily_schedule(day_plan):
+                logger.warning(f"Day {day_num + 1} schedule may be too packed")
+            
             daily_plans.append(day_plan)
             current_date += timedelta(days=1)
         
@@ -237,32 +316,56 @@ class ItineraryPlannerAgent(LlmAgent):
         pois: List[POI],
         num_days: int
     ) -> Dict[int, List[POI]]:
-        """Distribute POIs across trip days."""
+        """Distribute POIs across trip days based on time constraints and priority."""
         if not pois:
             return {}
         
-        # Calculate POIs per day
-        pois_per_day = max(2, len(pois) // num_days)
-        
         distributed = {}
-        poi_index = 0
+        remaining_pois = pois.copy()
+        
+        # Daily time budget (8 hours = 480 minutes, leave buffer for meals and transport)
+        daily_time_budget = 420  # 7 hours in minutes
         
         for day in range(num_days):
             day_pois = []
+            day_time_used = 0
             
-            # Add POIs for this day
-            for _ in range(pois_per_day):
-                if poi_index < len(pois):
-                    day_pois.append(pois[poi_index])
-                    poi_index += 1
+            # Reserve time for meals if not explicitly included
+            meal_time_reserved = 120  # 2 hours for meals
+            available_time = daily_time_budget - meal_time_reserved
             
-            # Distribute remaining POIs
-            if day == num_days - 1:  # Last day
-                while poi_index < len(pois):
-                    day_pois.append(pois[poi_index])
-                    poi_index += 1
+            # Try to fill the day with POIs based on time and priority
+            pois_to_remove = []
+            
+            for poi in remaining_pois:
+                poi_duration = poi.estimated_visit_duration or self._estimate_visit_duration(poi, "couple")
+                
+                # Add buffer time between activities (15 minutes for travel/rest)
+                buffer_time = 15 if day_pois else 0
+                total_time_needed = poi_duration + buffer_time
+                
+                # Check if we can fit this POI
+                if day_time_used + total_time_needed <= available_time:
+                    day_pois.append(poi)
+                    day_time_used += total_time_needed
+                    pois_to_remove.append(poi)
+                    
+                    # Don't overfill the day - aim for 4-6 activities max
+                    if len(day_pois) >= 6:
+                        break
+            
+            # Remove scheduled POIs from remaining list
+            for poi in pois_to_remove:
+                remaining_pois.remove(poi)
             
             distributed[day] = day_pois
+        
+        # If there are still remaining POIs, try to fit them in existing days
+        for poi in remaining_pois:
+            for day in range(num_days):
+                if len(distributed[day]) < 4:  # Only add to days with fewer activities
+                    distributed[day].append(poi)
+                    break
         
         return distributed
     
@@ -274,64 +377,350 @@ class ItineraryPlannerAgent(LlmAgent):
         trip_request: TripRequest,
         maps_tool: Optional[MapsApiTool]
     ) -> List[ItineraryItem]:
-        """Create itinerary items for a single day."""
+        """Create itinerary items for a single day with intelligent timing based on place characteristics."""
         items = []
         
         if not day_pois:
             return items
         
-        # Define time slots for the day
-        time_slots = self._generate_time_slots(len(day_pois))
+        # Get optimal timing for each POI
+        poi_timings = []
+        current_date = trip_request.start_date + timedelta(days=day_num - 1)
         
-        for i, poi in enumerate(day_pois):
-            # Estimate visit duration
-            duration = self._estimate_visit_duration(poi, trip_request.group_type)
+        for poi in day_pois:
+            time_category, optimal_start_minutes, reasoning = self._get_optimal_visit_time(poi, weather, current_date)
+            duration = poi.estimated_visit_duration or self._estimate_visit_duration(poi, trip_request.group_type)
+            
+            poi_timings.append({
+                'poi': poi,
+                'time_category': time_category,
+                'optimal_start_minutes': optimal_start_minutes,
+                'duration': duration,
+                'reasoning': reasoning
+            })
+        
+        # Sort POIs by optimal timing to create natural flow
+        poi_timings.sort(key=lambda x: x['optimal_start_minutes'])
+        
+        # Schedule activities with intelligent timing
+        current_time = None
+        lunch_break_added = False
+        
+        for i, poi_timing in enumerate(poi_timings):
+            poi = poi_timing['poi']
+            duration = poi_timing['duration']
+            optimal_start = poi_timing['optimal_start_minutes']
+            time_category = poi_timing['time_category']
+            reasoning = poi_timing['reasoning']
+            
+            # Determine actual start time
+            if current_time is None:
+                # First activity - use optimal time
+                start_time = optimal_start
+            else:
+                # Subsequent activities - consider both optimal time and logical flow
+                min_start_after_previous = current_time + 15  # 15 min buffer
+                
+                # If optimal time is much later, use it (e.g., sunset viewing)
+                if optimal_start > min_start_after_previous + 120:  # 2+ hours gap
+                    start_time = optimal_start
+                    # Add a break note if there's a big gap
+                    if optimal_start > current_time + 180:  # 3+ hours gap
+                        reasoning += f" | Break time: {self._minutes_to_time_string(current_time)} - {self._minutes_to_time_string(optimal_start)}"
+                else:
+                    # Use the later of optimal time or after previous activity
+                    start_time = max(optimal_start, min_start_after_previous)
+            
+            # Add lunch break if needed (around lunch time and no lunch break yet)
+            if (start_time >= 12 * 60 and not lunch_break_added and 
+                poi.category.value != "restaurant" and current_time is not None and 
+                current_time < 12 * 60):
+                
+                lunch_start = max(current_time + 15, 12 * 60)  # 12:00 PM
+                start_time = max(start_time, lunch_start + 60)  # After 1-hour lunch
+                lunch_break_added = True
+                reasoning += " | Lunch break: 12:00-13:00"
+            
+            # Calculate end time
+            end_time = start_time + duration
+            
+            # Create time slot string with category info
+            time_slot = f"{self._minutes_to_time_string(start_time)} - {self._minutes_to_time_string(end_time)} ({duration} min)"
+            if time_category in ["SUNRISE", "SUNSET"]:
+                time_slot += f" [{time_category}]"
             
             # Calculate transport to next POI
             transport_to_next = None
-            if i < len(day_pois) - 1 and maps_tool:
-                next_poi = day_pois[i + 1]
-                transport_to_next = self._calculate_transport(poi, next_poi, maps_tool)
+            travel_time = 0
+            if i < len(poi_timings) - 1 and maps_tool:
+                next_poi = poi_timings[i + 1]['poi']
+                transport_to_next = self._calculate_transport(poi, next_poi, maps_tool, trip_request.destination)
+                travel_time = transport_to_next.duration_minutes if transport_to_next else 15
             
             # Estimate cost
             cost_estimate = self._estimate_poi_cost(poi, trip_request)
             
+            # Generate enhanced notes with timing reasoning
+            notes = self._generate_enhanced_item_notes(poi, weather, duration, reasoning, time_category)
+            
             item = ItineraryItem(
                 day=day_num,
-                time_slot=time_slots[i] if i < len(time_slots) else "flexible",
+                time_slot=time_slot,
                 poi=poi,
                 estimated_duration=duration,
                 transport_to_next=transport_to_next,
                 cost_estimate=cost_estimate,
-                notes=self._generate_item_notes(poi, weather)
+                notes=notes
             )
             
             items.append(item)
+            
+            # Update current time for next activity
+            current_time = end_time + travel_time
+            
+            # Don't schedule past 11 PM for most activities (except nightlife)
+            if current_time > 23 * 60 and poi.category.value != "nightlife":
+                break
         
         return items
     
-    def _generate_time_slots(self, num_items: int) -> List[str]:
-        """Generate time slots for daily activities."""
-        if num_items <= 2:
-            return ["09:00-12:00", "14:00-17:00"]
-        elif num_items == 3:
-            return ["09:00-11:30", "12:30-15:00", "15:30-18:00"]
-        elif num_items == 4:
-            return ["09:00-11:00", "11:30-13:30", "14:30-16:30", "17:00-19:00"]
+    def _minutes_to_time_string(self, minutes: int) -> str:
+        """Convert minutes from midnight to HH:MM format."""
+        hours = minutes // 60
+        mins = minutes % 60
+        return f"{hours:02d}:{mins:02d}"
+    
+    def _calculate_sunrise_sunset(self, poi: POI, date_obj: date) -> Tuple[int, int]:
+        """Calculate sunrise and sunset times in minutes from midnight for a given location and date."""
+        try:
+            # Simplified sunrise/sunset calculation (for production, use a proper library like astral)
+            lat = math.radians(poi.coordinates.latitude)
+            
+            # Day of year
+            day_of_year = date_obj.timetuple().tm_yday
+            
+            # Solar declination
+            declination = 23.45 * math.sin(math.radians(360 * (284 + day_of_year) / 365))
+            declination = math.radians(declination)
+            
+            # Hour angle
+            hour_angle = math.acos(-math.tan(lat) * math.tan(declination))
+            hour_angle = math.degrees(hour_angle)
+            
+            # Sunrise and sunset in decimal hours
+            sunrise_decimal = 12 - hour_angle / 15
+            sunset_decimal = 12 + hour_angle / 15
+            
+            # Convert to minutes from midnight
+            sunrise_minutes = int(sunrise_decimal * 60)
+            sunset_minutes = int(sunset_decimal * 60)
+            
+            # Clamp to reasonable ranges
+            sunrise_minutes = max(300, min(sunrise_minutes, 420))  # Between 5:00 and 7:00 AM
+            sunset_minutes = max(1020, min(sunset_minutes, 1200))  # Between 5:00 and 8:00 PM
+            
+            return sunrise_minutes, sunset_minutes
+            
+        except Exception as e:
+            logger.warning(f"Could not calculate sunrise/sunset: {e}")
+            # Default sunrise at 6:30 AM, sunset at 6:30 PM
+            return 390, 1110
+    
+    def _get_optimal_visit_time(self, poi: POI, weather: Optional[WeatherInfo], date_obj: date) -> Tuple[str, int, str]:
+        """
+        Use AI to determine optimal visit time for a POI based on its characteristics and weather.
+        
+        Returns:
+            Tuple of (time_category, preferred_start_minutes, reasoning)
+        """
+        try:
+            sunrise_minutes, sunset_minutes = self._calculate_sunrise_sunset(poi, date_obj)
+            
+            # Create AI prompt for optimal timing
+            timing_prompt = f"""
+Analyze the optimal visit time for this place:
+
+Place: {poi.name}
+Category: {poi.category.value}
+Rating: {poi.rating or 'N/A'}
+Description: {poi.description or 'N/A'}
+Weather: {weather.condition.value if weather else 'Unknown'} 
+Temperature High: {weather.temperature_high if weather else 'Unknown'}°C
+Sunrise: {self._minutes_to_time_string(sunrise_minutes)}
+Sunset: {self._minutes_to_time_string(sunset_minutes)}
+
+Consider these factors:
+1. Place type and typical operating hours
+2. Weather conditions and temperature
+3. Sunrise/sunset times for photography opportunities
+4. Crowd patterns and best experience timing
+5. Cultural/religious considerations
+
+Respond with ONLY this format:
+TIME_CATEGORY: [SUNRISE/EARLY_MORNING/MORNING/AFTERNOON/SUNSET/EVENING/NIGHT]
+START_TIME: [HH:MM in 24-hour format]
+REASONING: [Brief explanation in 1-2 sentences]
+
+Examples:
+- Beach viewpoints: SUNRISE, 05:30, Best for sunrise photography and cooler temperatures
+- Temples: EARLY_MORNING, 06:00, Peaceful atmosphere for prayers and fewer crowds
+- Museums: MORNING, 10:00, Optimal lighting and moderate crowds
+- Markets: EVENING, 17:30, Best atmosphere and cooler temperatures
+- Restaurants: EVENING, 19:00, Typical dinner time with good ambiance
+"""
+            
+            ai_response = self._call_vertex_ai(timing_prompt)
+            
+            if ai_response:
+                return self._parse_timing_response(ai_response, sunrise_minutes, sunset_minutes)
+            else:
+                # Fallback to rule-based timing
+                return self._get_rule_based_timing(poi, weather, sunrise_minutes, sunset_minutes)
+                
+        except Exception as e:
+            logger.error(f"Error determining optimal visit time: {e}")
+            return self._get_rule_based_timing(poi, weather, 390, 1110)
+    
+    def _parse_timing_response(self, response: str, sunrise_minutes: int, sunset_minutes: int) -> Tuple[str, int, str]:
+        """Parse AI response for optimal timing."""
+        try:
+            lines = response.strip().split('\n')
+            time_category = ""
+            start_time = ""
+            reasoning = ""
+            
+            for line in lines:
+                if line.startswith("TIME_CATEGORY:"):
+                    time_category = line.split(":", 1)[1].strip()
+                elif line.startswith("START_TIME:"):
+                    start_time = line.split(":", 1)[1].strip()
+                elif line.startswith("REASONING:"):
+                    reasoning = line.split(":", 1)[1].strip()
+            
+            # Convert start_time to minutes
+            if start_time and ":" in start_time:
+                hours, minutes = map(int, start_time.split(":"))
+                start_minutes = hours * 60 + minutes
+            else:
+                # Fallback based on category
+                category_times = {
+                    "SUNRISE": sunrise_minutes - 30,
+                    "EARLY_MORNING": 360,  # 6:00 AM
+                    "MORNING": 540,        # 9:00 AM
+                    "AFTERNOON": 780,      # 1:00 PM
+                    "SUNSET": sunset_minutes - 60,
+                    "EVENING": 1080,       # 6:00 PM
+                    "NIGHT": 1200          # 8:00 PM
+                }
+                start_minutes = category_times.get(time_category, 540)
+            
+            return time_category, start_minutes, reasoning
+            
+        except Exception as e:
+            logger.warning(f"Could not parse timing response: {e}")
+            return "MORNING", 540, "Default morning timing"
+    
+    def _get_rule_based_timing(self, poi: POI, weather: Optional[WeatherInfo], sunrise_minutes: int, sunset_minutes: int) -> Tuple[str, int, str]:
+        """Fallback rule-based timing when AI is not available."""
+        category = poi.category.value
+        
+        # Rule-based timing decisions
+        if category in ["beach", "park"] and poi.name.lower().find("sunrise") != -1:
+            return "SUNRISE", sunrise_minutes - 30, "Best for sunrise viewing"
+        elif category in ["beach", "park"] and poi.name.lower().find("sunset") != -1:
+            return "SUNSET", sunset_minutes - 60, "Perfect for sunset viewing"
+        elif category == "religious":
+            return "EARLY_MORNING", 360, "Peaceful morning prayers"
+        elif category == "museum":
+            return "MORNING", 600, "Avoid afternoon crowds"
+        elif category == "restaurant":
+            if "breakfast" in poi.name.lower():
+                return "EARLY_MORNING", 480, "Breakfast time"
+            elif "lunch" in poi.name.lower():
+                return "AFTERNOON", 720, "Lunch time"
+            else:
+                return "EVENING", 1140, "Dinner time"
+        elif category == "nightlife":
+            return "NIGHT", 1260, "Evening entertainment"
+        elif category in ["shopping", "market"]:
+            # Consider weather for market timing
+            if weather and weather.temperature_high and weather.temperature_high > 30:
+                return "EVENING", 1020, "Cooler evening shopping"
+            else:
+                return "AFTERNOON", 840, "Good shopping hours"
+        elif category in ["adventure", "amusement_park"]:
+            return "MORNING", 540, "Full day adventure"
         else:
-            # For more items, distribute evenly
-            slots = []
-            start_hour = 9
-            slot_duration = min(3, 10 // num_items)  # Max 3 hours per slot
-            
-            for i in range(num_items):
-                start = start_hour + (i * slot_duration)
-                end = start + slot_duration
-                if end > 19:  # Don't go past 7 PM
-                    end = 19
-                slots.append(f"{start:02d}:00-{end:02d}:00")
-            
-            return slots
+            return "MORNING", 540, "Standard morning visit"
+    
+    def _generate_enhanced_item_notes(self, poi: POI, weather: Optional[WeatherInfo], duration: int, timing_reasoning: str = "", time_category: str = "") -> str:
+        """Generate enhanced notes for itinerary items with timing intelligence."""
+        notes = []
+        
+        # Add POI description if available
+        if poi.description:
+            notes.append(poi.description)
+        
+        # Add timing reasoning from AI
+        if timing_reasoning:
+            notes.append(f"🕘 {timing_reasoning}")
+        
+        # Add special timing alerts
+        if time_category == "SUNRISE":
+            notes.append("🌅 Early morning activity - dress warmly and bring camera")
+        elif time_category == "SUNSET":
+            notes.append("🌇 Perfect for sunset photography and romantic atmosphere")
+        elif time_category == "NIGHT":
+            notes.append("🌙 Evening activity - check safety and transportation")
+        
+        # Add duration note
+        duration_hours = duration // 60
+        duration_mins = duration % 60
+        if duration_hours > 0:
+            if duration_mins > 0:
+                notes.append(f"⏱️ Estimated visit time: {duration_hours}h {duration_mins}m")
+            else:
+                notes.append(f"⏱️ Estimated visit time: {duration_hours}h")
+        else:
+            notes.append(f"⏱️ Estimated visit time: {duration_mins}m")
+        
+        # Add weather-related notes with more intelligence
+        if weather and poi.category.value in ["park", "beach", "attraction", "adventure"]:
+            if weather.condition and "rain" in weather.condition.lower():
+                notes.append("☔ Weather alert - indoor backup recommended")
+            elif weather.temperature_high:
+                if weather.temperature_high > 35:
+                    notes.append("🔥 Very hot - early morning or evening visit recommended")
+                elif weather.temperature_high > 30:
+                    notes.append("🌞 Hot weather - bring water and sun protection")
+                elif weather.temperature_high < 10:
+                    notes.append("🧥 Cold weather - dress warmly")
+                elif weather.temperature_high < 15:
+                    notes.append("🧥 Cool weather - light jacket recommended")
+        
+        # Add rating info if available
+        if poi.rating and poi.rating >= 4.5:
+            notes.append(f"⭐ Exceptional ({poi.rating}/5)")
+        elif poi.rating and poi.rating >= 4.0:
+            notes.append(f"⭐ Highly rated ({poi.rating}/5)")
+        
+        # Add category-specific tips
+        if poi.category.value == "religious":
+            notes.append("🙏 Dress modestly and respect local customs")
+        elif poi.category.value == "museum":
+            notes.append("🎫 Consider booking tickets in advance")
+        elif poi.category.value == "restaurant":
+            notes.append("🍽️ Check for reservations if upscale dining")
+        elif poi.category.value == "beach":
+            notes.append("🏖️ Bring sunscreen, water, and beach essentials")
+        elif poi.category.value == "adventure":
+            notes.append("👟 Wear appropriate clothing and footwear")
+        
+        # Add opening hours reminder if available
+        if poi.opening_hours:
+            notes.append("💡 Verify opening hours before visiting")
+        
+        return " | ".join(notes)
     
     def _estimate_visit_duration(self, poi: POI, group_type: str) -> int:
         """Estimate visit duration for a POI."""
@@ -351,12 +740,55 @@ class ItineraryPlannerAgent(LlmAgent):
             "entertainment": 180,
             "religious": 60,
             "beach": 180,
-            "adventure": 240
+            "adventure": 240,
+            "tourist_attraction": 120,
+            "amusement_park": 240,
+            "zoo": 180,
+            "aquarium": 150
         }
         
         base_duration = base_durations.get(poi.category.value, 120)
         
         # Adjust for group type
+        group_multipliers = {
+            "family": 1.3,  # Families take longer
+            "couple": 1.0,
+            "solo": 0.8,    # Solo travelers move faster
+            "friends": 1.1,
+            "business": 0.9
+        }
+        
+        duration = base_duration * group_multipliers.get(group_type, 1.0)
+        
+        # Adjust for rating (higher rated places deserve more time)
+        if poi.rating:
+            if poi.rating >= 4.5:
+                duration *= 1.2
+            elif poi.rating >= 4.0:
+                duration *= 1.1
+            elif poi.rating < 3.0:
+                duration *= 0.8
+        
+            return int(duration)
+    
+    def _validate_daily_schedule(self, day_plan: DayPlan) -> bool:
+        """Validate that a daily schedule is reasonable and not overpacked."""
+        if not day_plan.items:
+            return True
+        
+        total_duration = sum(item.estimated_duration for item in day_plan.items)
+        
+        # Check if total time exceeds reasonable daily limit (7-8 hours)
+        if total_duration > 480:  # 8 hours
+            logger.warning(f"Day {day_plan.day} schedule exceeds 8 hours ({total_duration} minutes)")
+            return False
+        
+        # Check if too many activities (more than 6 is usually too hectic)
+        if len(day_plan.items) > 6:
+            logger.warning(f"Day {day_plan.day} has too many activities ({len(day_plan.items)})")
+            return False
+        
+        return True        # Adjust for group type
         if group_type == "family":
             base_duration = int(base_duration * 1.2)  # Families take longer
         elif group_type == "solo":
@@ -368,9 +800,10 @@ class ItineraryPlannerAgent(LlmAgent):
         self,
         from_poi: POI,
         to_poi: POI,
-        maps_tool: MapsApiTool
+        maps_tool: MapsApiTool,
+        destination: str = "unknown"
     ) -> Optional[TransportOption]:
-        """Calculate transport between two POIs."""
+        """Calculate transport between two POIs with multiple options."""
         try:
             # Get directions between POIs
             from_location = f"{from_poi.coordinates.latitude},{from_poi.coordinates.longitude}"
@@ -380,14 +813,45 @@ class ItineraryPlannerAgent(LlmAgent):
             
             if directions and directions[0].get("legs"):
                 leg = directions[0]["legs"][0]
+                distance_km = leg["distance"]["value"] / 1000
+                walking_duration = leg["duration"]["value"] // 60
                 
-                return TransportOption(
+                # Calculate costs for different transport modes
+                base_taxi_rate = 0.5  # USD per km
+                base_public_rate = 0.3  # USD per km
+                
+                taxi_cost = max(2.0, distance_km * base_taxi_rate)  # Minimum fare
+                public_cost = max(0.5, distance_km * base_public_rate)
+                
+                # Return walking as primary option with additional info
+                transport_option = TransportOption(
                     mode="walking",
-                    duration_minutes=leg["duration"]["value"] // 60,
-                    distance_km=leg["distance"]["value"] / 1000,
+                    duration_minutes=walking_duration,
+                    distance_km=distance_km,
                     cost=Decimal("0"),  # Walking is free
                     route_description=leg.get("summary", "")
                 )
+                
+                # Add transport alternatives as description
+                alternatives = []
+                
+                if distance_km <= 3.0:  # Show walking for reasonable distances
+                    alternatives.append(f"🚶 Walking: {walking_duration} min, Free")
+                
+                driving_time = max(5, int((distance_km / 25.0) * 60))  # Urban speed
+                alternatives.append(f"🚗 Taxi: {driving_time} min, {self._format_currency(Decimal(str(taxi_cost)), destination)}")
+                
+                if distance_km > 0.5:  # Public transport for longer distances
+                    public_time = int((distance_km / 15.0) * 60) + 5  # Add wait time
+                    alternatives.append(f"🚌 Public: {public_time} min, {self._format_currency(Decimal(str(public_cost)), destination)}")
+                
+                if distance_km > 2.0:  # Ride-sharing for longer distances
+                    rideshare_cost = taxi_cost * 0.8
+                    alternatives.append(f"📱 Uber/Ola: {driving_time + 3} min, {self._format_currency(Decimal(str(rideshare_cost)), destination)}")
+                
+                transport_option.route_description = f"{leg.get('summary', '')} | Options: {' | '.join(alternatives)}"
+                
+                return transport_option
             
             return None
             
@@ -546,7 +1010,8 @@ class ItineraryPlannerAgent(LlmAgent):
     def _update_transport_info(
         self,
         items: List[ItineraryItem],
-        maps_tool: MapsApiTool
+        maps_tool: MapsApiTool,
+        destination: str
     ) -> List[ItineraryItem]:
         """Update transport information between optimized POIs."""
         updated_items = []
@@ -557,7 +1022,7 @@ class ItineraryPlannerAgent(LlmAgent):
             # Calculate transport to next POI
             if i < len(items) - 1:
                 next_poi = items[i + 1].poi
-                transport = self._calculate_transport(item.poi, next_poi, maps_tool)
+                transport = self._calculate_transport(item.poi, next_poi, maps_tool, destination)
                 updated_item.transport_to_next = transport
             else:
                 updated_item.transport_to_next = None
@@ -692,23 +1157,57 @@ Provide enhancements in JSON format:
         )
     
     def _create_itinerary_summary(self, itinerary: Itinerary) -> Dict[str, Any]:
-        """Create a summary of the itinerary."""
+        """Create a comprehensive summary of the itinerary."""
+        total_activities = sum(len(day.items) for day in itinerary.days)
+        destination = itinerary.trip_request.destination
+        
+        # Calculate total estimated time
+        total_time_minutes = 0
+        for day in itinerary.days:
+            for item in day.items:
+                total_time_minutes += item.estimated_duration
+        
+        total_hours = total_time_minutes // 60
+        
         summary = {
-            "destination": itinerary.trip_request.destination,
+            "destination": destination,
             "duration_days": len(itinerary.days),
-            "total_cost": float(itinerary.total_cost),
-            "total_activities": sum(len(day.items) for day in itinerary.days),
+            "total_cost": self._format_currency(itinerary.total_cost, destination),
+            "total_activities": total_activities,
+            "total_estimated_time": f"{total_hours}h {total_time_minutes % 60}m",
+            "average_activities_per_day": round(total_activities / len(itinerary.days), 1),
             "daily_breakdown": []
         }
         
         for day in itinerary.days:
+            # Calculate day's total time
+            day_time_minutes = sum(item.estimated_duration for item in day.items)
+            day_hours = day_time_minutes // 60
+            
+            # Get time range for the day
+            if day.items:
+                first_time = day.items[0].time_slot.split(' - ')[0]
+                last_item = day.items[-1]
+                last_time_parts = last_item.time_slot.split(' - ')
+                if len(last_time_parts) > 1:
+                    last_time = last_time_parts[1].split(' (')[0]  # Remove duration part
+                else:
+                    last_time = "Evening"
+                time_range = f"{first_time} - {last_time}"
+            else:
+                time_range = "No activities scheduled"
+            
             day_summary = {
                 "day": day.day,
                 "date": day.date.isoformat(),
                 "activities": len(day.items),
-                "estimated_cost": float(day.total_estimated_cost),
-                "weather": day.weather.condition.value if day.weather else None
+                "estimated_cost": self._format_currency(day.total_estimated_cost, destination),
+                "total_time": f"{day_hours}h {day_time_minutes % 60}m",
+                "time_range": time_range,
+                "weather": day.weather.condition.value if day.weather and hasattr(day.weather.condition, 'value') else (day.weather.condition if day.weather else None),
+                "activity_preview": [item.poi.name for item in day.items]  # Show all activities
             }
+            
             summary["daily_breakdown"].append(day_summary)
         
         return summary

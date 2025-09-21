@@ -258,25 +258,168 @@ class PlaceFinderAgent(LlmAgent):
         
         return filtered_pois
     
+    def _enhance_poi_details(self, poi: POI, trip_request: TripRequest) -> POI:
+        """Enhance POI with better descriptions and time estimates."""
+        try:
+            # Generate AI description if not exists or is too short
+            if not poi.description or len(poi.description) < 50:
+                description_prompt = f"""
+Generate a concise, engaging description (1-2 sentences, max 100 words) for this place:
+
+Name: {poi.name}
+Category: {poi.category.value}
+Rating: {poi.rating or 'N/A'}
+Address: {poi.address.formatted_address if poi.address else 'N/A'}
+
+Focus on what makes this place special and why travelers would want to visit. 
+Example format: "Lalbagh Botanical Garden, a beautiful sprawling garden with diverse flora and fauna, perfect for peaceful walks and nature photography."
+"""
+                ai_description = self._call_vertex_ai(description_prompt)
+                if ai_description and len(ai_description) > 20:
+                    poi.description = ai_description.strip().replace('"', '')
+            
+            # Estimate visit duration if not set
+            if not poi.estimated_visit_duration:
+                poi.estimated_visit_duration = self._estimate_visit_duration_by_category(
+                    poi.category.value, 
+                    trip_request.group_type,
+                    poi.rating or 3.0
+                )
+            
+            # Calculate priority score
+            poi.popularity_score = self._calculate_priority_score(poi, trip_request)
+            
+            return poi
+            
+        except Exception as e:
+            logger.error(f"Error enhancing POI details: {e}")
+            return poi
+    
+    def _estimate_visit_duration_by_category(self, category: str, group_type: str, rating: float) -> int:
+        """Estimate visit duration based on category, group type, and rating."""
+        # Base durations in minutes by category
+        base_durations = {
+            "restaurant": 90,
+            "attraction": 120,
+            "museum": 180,
+            "park": 90,
+            "shopping": 120,
+            "nightlife": 150,
+            "accommodation": 30,
+            "transport": 15,
+            "entertainment": 180,
+            "religious": 60,
+            "beach": 180,
+            "adventure": 240,
+            "tourist_attraction": 120,
+            "amusement_park": 240,
+            "zoo": 180,
+            "aquarium": 150,
+            "library": 90,
+            "church": 45,
+            "temple": 60,
+            "mosque": 45,
+            "synagogue": 45
+        }
+        
+        base_duration = base_durations.get(category, 120)
+        
+        # Adjust for group type
+        group_multipliers = {
+            "family": 1.3,  # Families take longer
+            "couple": 1.0,
+            "solo": 0.8,    # Solo travelers move faster
+            "friends": 1.1,
+            "business": 0.9
+        }
+        
+        duration = base_duration * group_multipliers.get(group_type, 1.0)
+        
+        # Adjust for rating (higher rated places deserve more time)
+        if rating >= 4.5:
+            duration *= 1.2
+        elif rating >= 4.0:
+            duration *= 1.1
+        elif rating < 3.0:
+            duration *= 0.8
+        
+        return int(duration)
+    
+    def _calculate_priority_score(self, poi: POI, trip_request: TripRequest) -> float:
+        """Calculate priority score for POI based on various factors."""
+        score = 0.0
+        
+        # Base score from rating
+        if poi.rating:
+            score += poi.rating * 15  # Max 75 points
+        
+        # Review count factor (more reviews = more reliable)
+        if poi.review_count:
+            review_score = min(poi.review_count / 100, 10)  # Max 10 points
+            score += review_score
+        
+        # Category relevance to interests
+        if trip_request.special_interests:
+            category_keywords = {
+                "restaurant": ["food", "dining", "cuisine"],
+                "museum": ["culture", "history", "art"],
+                "park": ["nature", "outdoor", "relaxation"],
+                "attraction": ["sightseeing", "tourist", "landmark"],
+                "shopping": ["shopping", "market", "souvenir"],
+                "religious": ["spiritual", "temple", "church"],
+                "beach": ["beach", "water", "swimming"],
+                "adventure": ["adventure", "sports", "thrill"]
+            }
+            
+            poi_keywords = category_keywords.get(poi.category.value, [])
+            for interest in trip_request.special_interests:
+                if any(keyword in interest.lower() for keyword in poi_keywords):
+                    score += 10  # Bonus for matching interests
+        
+        # Price level consideration (budget-friendly gets bonus)
+        if poi.price_level:
+            if trip_request.budget_range == "budget" and poi.price_level <= 2:
+                score += 5
+            elif trip_request.budget_range == "luxury" and poi.price_level >= 3:
+                score += 5
+            elif trip_request.budget_range == "mid-range" and poi.price_level == 2:
+                score += 5
+        
+        return min(score, 100.0)  # Cap at 100
+
     def _enhance_recommendations(self, pois: List[POI], trip_request: TripRequest) -> List[POI]:
         """Use AI to enhance and rank place recommendations."""
         try:
             if not pois:
                 return pois
             
+            # First enhance each POI with descriptions and time estimates
+            enhanced_pois = []
+            for poi in pois:
+                enhanced_poi = self._enhance_poi_details(poi, trip_request)
+                enhanced_pois.append(enhanced_poi)
+            
+            # Sort by priority score first
+            enhanced_pois.sort(key=lambda p: p.popularity_score or 0, reverse=True)
+            
+            # Take top POIs for AI ranking (to avoid token limits)
+            top_pois = enhanced_pois[:20] if len(enhanced_pois) > 20 else enhanced_pois
+            
             # Create prompt for AI ranking
-            prompt = self._create_ranking_prompt(pois, trip_request)
+            prompt = self._create_ranking_prompt(top_pois, trip_request)
             
             # Call Vertex AI
             response = self._call_vertex_ai(prompt)
             
             if response:
                 # Parse AI response to get ranking
-                ranked_pois = self._parse_ranking_response(response, pois)
-                return ranked_pois
+                ranked_top_pois = self._parse_ranking_response(response, top_pois)
+                # Add remaining POIs at the end
+                remaining_pois = enhanced_pois[20:] if len(enhanced_pois) > 20 else []
+                return ranked_top_pois + remaining_pois
             else:
-                # Fallback to simple rating-based ranking
-                return sorted(pois, key=lambda p: p.rating or 0, reverse=True)
+                # Fallback to priority score ranking
+                return enhanced_pois
                 
         except Exception as e:
             logger.error(f"Error enhancing recommendations: {e}")
