@@ -563,6 +563,7 @@ Provide insights in JSON format:
                 return self._create_error_response("Session management not available", "Missing Firestore tool")
             
             session_data = tools["firestore"].get_session(session_id)
+            print('session_data',session_data)
             if not session_data:
                 return self._create_error_response("Session not found", "Invalid session ID")
             

@@ -7,7 +7,7 @@ using Google's Agent Development Kit (ADK).
 
 import os
 import logging
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 from adk import AdkApp, Session, Tool, Agent
 from dotenv import load_dotenv
 
@@ -195,6 +195,43 @@ class TripPlannerApp(AdkApp):
             except Exception as e:
                 logger.error(f"Error registering agent {agent_name}: {e}")
     
+    def ensure_session_registered(self, session: Session) -> Session:
+        """Ensure session is properly registered with the application."""
+        # Register with app's session store
+        if hasattr(session, 'id') and session.id not in self.sessions:
+            self.sessions[session.id] = session
+            logger.info(f"Registered session {session.id} with application")
+        
+        # Always try to save to Firestore for orchestrator compatibility
+        firestore_tool = self.tools.get("firestore")
+        if firestore_tool and hasattr(session, 'id'):
+            try:
+                # Check if session already exists in Firestore
+                existing_session = firestore_tool.get_session(session.id)
+                if not existing_session:
+                    from schemas import SessionData
+                    from datetime import datetime
+                    
+                    # Create SessionData object for Firestore
+                    session_data = SessionData(
+                        session_id=session.id,
+                        user_id=getattr(session, 'user_id', 'unknown'),
+                        created_at=datetime.utcnow(),
+                        conversation_history=[]
+                    )
+                    
+                    # Save to Firestore
+                    result = firestore_tool.save_session(session_data)
+                    if result:
+                        logger.info(f"Saved session {session.id} to Firestore")
+                    else:
+                        logger.warning(f"Failed to save session {session.id} to Firestore")
+                    
+            except Exception as e:
+                logger.warning(f"Failed to save session to Firestore: {e}")
+                    
+        return session
+    
     async def process_user_input(self, user_input: str, session: Session) -> str:
         """
         Process user input through the trip planning workflow.
@@ -207,6 +244,9 @@ class TripPlannerApp(AdkApp):
             Response message
         """
         try:
+            # Ensure session is registered with the app
+            session = self.ensure_session_registered(session)
+            
             # Get the orchestrator agent
             orchestrator = self.agents.get("orchestrator")
             if not orchestrator:
@@ -355,6 +395,136 @@ class TripPlannerApp(AdkApp):
         except Exception as e:
             logger.error(f"Error getting session status: {e}")
             return "Error retrieving session status."
+    
+    def get_user_sessions(self, user_id: str, limit: Optional[int] = None, active_only: bool = False) -> List[Dict[str, Any]]:
+        """
+        Get all sessions for a specific user.
+        
+        Args:
+            user_id: User ID to retrieve sessions for
+            limit: Maximum number of sessions to return
+            active_only: If True, only return active sessions
+            
+        Returns:
+            List of session dictionaries
+        """
+        try:
+            firestore_tool = self.tools.get("firestore")
+            if not firestore_tool:
+                logger.error("Firestore tool not available")
+                return []
+            
+            sessions = firestore_tool.get_user_sessions(user_id, limit, active_only)
+            
+            # Convert to dictionary format for easier consumption
+            session_list = []
+            for session in sessions:
+                session_dict = {
+                    "session_id": session.session_id,
+                    "user_id": session.user_id,
+                    "created_at": session.created_at.isoformat() if session.created_at else None,
+                    "last_activity": session.last_activity.isoformat() if session.last_activity else None,
+                    "is_active": session.is_active,
+                    "has_trip_request": session.trip_request is not None,
+                    "has_itinerary": session.current_itinerary is not None,
+                    "conversation_length": len(session.conversation_history)
+                }
+                
+                # Add trip details if available
+                if session.trip_request:
+                    session_dict["destination"] = session.trip_request.destination
+                    session_dict["start_date"] = session.trip_request.start_date.isoformat() if session.trip_request.start_date else None
+                    session_dict["duration_days"] = session.trip_request.duration_days
+                
+                session_list.append(session_dict)
+            
+            return session_list
+            
+        except Exception as e:
+            logger.error(f"Error retrieving user sessions: {e}")
+            return []
+    
+    def get_user_latest_session(self, user_id: str) -> Optional[Session]:
+        """
+        Get the most recent session for a user and load it into the app.
+        
+        Args:
+            user_id: User ID to get latest session for
+            
+        Returns:
+            Session object or None if not found
+        """
+        try:
+            firestore_tool = self.tools.get("firestore")
+            if not firestore_tool:
+                logger.error("Firestore tool not available")
+                return None
+            
+            session_data = firestore_tool.get_user_latest_session(user_id)
+            if session_data:
+                # Create ADK Session object
+                session = Session(session_id=session_data.session_id, user_id=session_data.user_id)
+                
+                # Register with app
+                self.sessions[session_data.session_id] = session
+                
+                logger.info(f"Loaded latest session {session_data.session_id} for user {user_id}")
+                return session
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error getting user latest session: {e}")
+            return None
+    
+    def format_user_sessions_summary(self, user_id: str) -> str:
+        """
+        Get a formatted summary of all sessions for a user.
+        
+        Args:
+            user_id: User ID to get sessions summary for
+            
+        Returns:
+            Formatted string with session summary
+        """
+        try:
+            sessions = self.get_user_sessions(user_id)
+            
+            if not sessions:
+                return f"👤 **User {user_id}**\n❌ No sessions found."
+            
+            # Get user info
+            firestore_tool = self.tools.get("firestore")
+            user_info = firestore_tool.get_user_info(user_id) if firestore_tool else None
+            
+            summary = f"👤 **User {user_id}**\n"
+            summary += f"📊 **Total Sessions:** {len(sessions)}\n"
+            
+            if user_info:
+                if 'last_activity' in user_info:
+                    summary += f"⏰ **Last Activity:** {user_info['last_activity']}\n"
+            
+            active_sessions = [s for s in sessions if s['is_active']]
+            summary += f"🔄 **Active Sessions:** {len(active_sessions)}\n\n"
+            
+            summary += "📋 **Recent Sessions:**\n"
+            for i, session in enumerate(sessions[:5], 1):  # Show top 5 recent sessions
+                status_icon = "🟢" if session['is_active'] else "🔴"
+                summary += f"{status_icon} **{session['session_id'][:8]}...** "
+                
+                if session.get('destination'):
+                    summary += f"({session['destination']}) "
+                
+                summary += f"- {session['last_activity'][:10]}\n"
+            
+            if len(sessions) > 5:
+                summary += f"... and {len(sessions) - 5} more sessions\n"
+            
+            return summary
+            
+        except Exception as e:
+            logger.error(f"Error formatting user sessions summary: {e}")
+            return f"❌ Error retrieving sessions for user {user_id}"
 
 
 # Create the main application instance
@@ -375,21 +545,165 @@ async def handle_message(user_input: str, session: Session) -> str:
 # For local development and testing
 if __name__ == "__main__":
     import asyncio
+    import sys
+    from adk import Session as AdkSession
     
-    async def test_app():
-        """Test the application locally."""
-        print("🚀 Trip Planner ADK Application")
+    async def interactive_session():
+        """Interactive session for single user trip planning."""
+        print("🚀 Trip Planner - Interactive Mode")
+        print("=" * 50)
+        print("Welcome to your AI-powered trip planning assistant!")
+        print("Type 'quit', 'exit', or 'bye' to end the session.")
+        print("Type 'help' for available commands.")
         print("=" * 50)
         
-        # Create a mock session
-        class MockSession:
-            def __init__(self):
-                self.id = "test-session-123"
-                self.user_id = "test-user-456"
+        # Get user ID
+        try:
+            user_id = input("\n👤 Enter your user ID (or press Enter for default): ").strip()
+        except EOFError:
+            user_id = ""
         
-        session = MockSession()
+        if not user_id:
+            user_id = "default-user"
         
-        # Test user inputs
+        print(f"Hello {user_id}! Let's plan your perfect trip!")
+        
+        # Check for existing sessions for this user
+        existing_sessions = app.get_user_sessions(user_id, limit=3, active_only=True)
+        
+        session = None
+        if existing_sessions:
+            print(f"\n📋 Found {len(existing_sessions)} active session(s) for you:")
+            for i, sess in enumerate(existing_sessions, 1):
+                created = sess['created_at'][:10] if sess.get('created_at') else 'Unknown'
+                destination = sess.get('destination', 'No destination set')
+                print(f"  {i}. Session {sess['session_id'][:8]}... - {destination} ({created})")
+            
+            choice = input(f"\nWould you like to continue an existing session? (1-{len(existing_sessions)}/new): ").strip().lower()
+            
+            if choice.isdigit() and 1 <= int(choice) <= len(existing_sessions):
+                selected_session = existing_sessions[int(choice) - 1]
+                # Load the existing session
+                session = app.get_user_latest_session(user_id)
+                if session and session.id == selected_session['session_id']:
+                    print(f"✅ Continuing session {session.id[:8]}...")
+                else:
+                    # Create session object from session data
+                    session = Session(session_id=selected_session['session_id'], user_id=user_id)
+                    app.sessions[session.id] = session
+                    print(f"✅ Loaded session {session.id[:8]}...")
+        
+        # Create new session if none selected
+        if not session:
+            print("🆕 Creating a new session...")
+            session = app.create_session(user_id=user_id)
+            session = app.ensure_session_registered(session)
+            print(f"✅ Created new session {session.id[:8]}...")
+        
+        print(f"\n🎯 Session ID: {session.id}")
+        print("You can use this session ID to continue later.")
+        print("\n" + "=" * 50)
+        
+        # Interactive loop
+        conversation_count = 0
+        while True:
+            try:
+                # Get user input
+                try:
+                    user_input = input(f"\n[{conversation_count + 1}] You: ").strip()
+                except EOFError:
+                    print("\n👋 Input stream ended. Goodbye!")
+                    break
+                
+                if not user_input:
+                    continue
+                
+                # Check for exit commands
+                if user_input.lower() in ['quit', 'exit', 'bye']:
+                    print("\n👋 Thanks for using Trip Planner! Have a great trip!")
+                    break
+                
+                # Check for help command
+                if user_input.lower() == 'help':
+                    print("\n📋 Available commands:")
+                    print("  - Type your trip planning request naturally")
+                    print("  - 'sessions' - View your recent sessions")
+                    print("  - 'status' - Check current session status")
+                    print("  - 'clear' - Start a new session")
+                    print("  - 'help' - Show this help")
+                    print("  - 'quit', 'exit', 'bye' - End session")
+                    continue
+                
+                # Check for special commands
+                if user_input.lower() == 'sessions':
+                    summary = app.format_user_sessions_summary(user_id)
+                    print(f"\n{summary}")
+                    continue
+                
+                if user_input.lower() == 'status':
+                    status = app.get_session_status(session.id)
+                    print(f"\n{status}")
+                    continue
+                
+                if user_input.lower() == 'clear':
+                    session = app.create_session(user_id=user_id)
+                    session = app.ensure_session_registered(session)
+                    print(f"🆕 Created new session {session.id[:8]}...")
+                    conversation_count = 0
+                    continue
+                
+                # Process the trip planning request
+                print(f"\n🤖 Assistant: Processing your request...")
+                
+                response = await app.process_user_input(user_input, session)
+                print(f"\n🤖 Assistant: {response}")
+                
+                conversation_count += 1
+                
+            except KeyboardInterrupt:
+                print("\n\n👋 Session interrupted. Goodbye!")
+                break
+            except Exception as e:
+                print(f"\n❌ Error: {e}")
+                print("Please try again or type 'help' for assistance.")
+    
+    async def test_multi_user_sessions():
+        """Test the application with multiple users (for development/testing)."""
+        print("🚀 Trip Planner ADK Application - Multi-User Test Mode")
+        print("=" * 50)
+        
+        # Test multiple users with sessions
+        test_users = ["user-123", "user-456", "user-789"]
+        all_sessions = {}
+        
+        # Create sessions for different users
+        for user_id in test_users:
+            print(f"\n👤 Creating session for {user_id}")
+            session = app.create_session(user_id=user_id)
+            session = app.ensure_session_registered(session)
+            all_sessions[user_id] = session
+            print(f"✅ Created session {session.id[:8]}... for {user_id}")
+        
+        # Test user session retrieval
+        print(f"\n📋 Testing user session management")
+        print("-" * 50)
+        
+        for user_id in test_users:
+            sessions = app.get_user_sessions(user_id)
+            print(f"User {user_id}: {len(sessions)} sessions")
+            
+            latest_session = app.get_user_latest_session(user_id)
+            if latest_session:
+                print(f"  Latest session: {latest_session.id[:8]}...")
+        
+        # Test trip planning with one user
+        test_user = test_users[0]
+        session = all_sessions[test_user]
+        
+        print(f"\n🎯 Testing trip planning for {test_user}")
+        print("-" * 50)
+        
+        # Test user inputs for this specific user
         test_inputs = [
             "I want to plan a 3-day trip to Paris for 2 adults, budget around $2000, interested in art and food",
             "Can you make it cheaper?",
@@ -397,22 +711,60 @@ if __name__ == "__main__":
         ]
         
         for i, user_input in enumerate(test_inputs, 1):
-            print(f"\n[Test {i}] User: {user_input}")
-            print("-" * 50)
+            print(f"\n[Test {i}] User {test_user}: {user_input}")
+            print("-" * 30)
             
             try:
                 response = await app.process_user_input(user_input, session)
                 print(f"Assistant: {response}")
             except Exception as e:
                 print(f"Error: {e}")
+                import traceback
+                traceback.print_exc()
             
             print("\n" + "=" * 50)
         
-        # Test session status
-        print(f"\n[Session Status]")
+        # Test user sessions summary
+        print(f"\n📊 User Sessions Summary")
+        print("-" * 50)
+        for user_id in test_users:
+            summary = app.format_user_sessions_summary(user_id)
+            print(summary)
+            print("-" * 30)
+        
+        # Test session status for the main test user
+        print(f"\n🔍 Session Status for {test_user}")
         print("-" * 50)
         status = app.get_session_status(session.id)
         print(status)
     
-    # Run the test
-    asyncio.run(test_app())
+    async def main():
+        """Main entry point - choose between interactive and test mode."""
+        # Check command line arguments
+        if len(sys.argv) > 1:
+            if sys.argv[1] in ['--test', '-t', '--multi-user', '-m']:
+                await test_multi_user_sessions()
+            elif sys.argv[1] in ['--help', '-h']:
+                print("🚀 Trip Planner ADK Application")
+                print("=" * 50)
+                print("Usage:")
+                print("  python app.py                    # Interactive mode (default)")
+                print("  python app.py --test            # Multi-user test mode")
+                print("  python app.py --multi-user      # Multi-user test mode")
+                print("  python app.py --help            # Show this help")
+                print("\nInteractive mode commands:")
+                print("  - Type your trip planning requests naturally")
+                print("  - 'sessions' - View your sessions")
+                print("  - 'status' - Check session status")
+                print("  - 'clear' - Start new session")
+                print("  - 'help' - Show help")
+                print("  - 'quit' - Exit")
+            else:
+                print(f"❌ Unknown argument: {sys.argv[1]}")
+                print("Use --help for usage information")
+        else:
+            # Default: interactive mode
+            await interactive_session()
+    
+    # Run the application
+    asyncio.run(main())

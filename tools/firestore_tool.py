@@ -38,6 +38,16 @@ class FirestoreTool(Tool):
             return self.save_session(**kwargs)
         elif operation == "get_session":
             return self.get_session(**kwargs)
+        elif operation == "get_user_sessions":
+            return self.get_user_sessions(**kwargs)
+        elif operation == "get_user_latest_session":
+            return self.get_user_latest_session(**kwargs)
+        elif operation == "get_user_active_sessions":
+            return self.get_user_active_sessions(**kwargs)
+        elif operation == "get_user_info":
+            return self.get_user_info(**kwargs)
+        elif operation == "delete_user_session":
+            return self.delete_user_session(**kwargs)
         elif operation == "save_itinerary":
             return self.save_itinerary(**kwargs)
         else:
@@ -45,7 +55,7 @@ class FirestoreTool(Tool):
     
     def save_session(self, session_data: SessionData) -> bool:
         """
-        Save session data to Firestore.
+        Save session data to Firestore with user-specific organization.
         
         Args:
             session_data: Session data to save
@@ -54,13 +64,33 @@ class FirestoreTool(Tool):
             True if successful, False otherwise
         """
         try:
-            doc_ref = self.client.collection('sessions').document(session_data.session_id)
-            
             # Convert to dict for Firestore
             session_dict = session_data.dict()
             session_dict['last_activity'] = datetime.utcnow()
             
-            doc_ref.set(session_dict, merge=True)
+            # Save to main sessions collection
+            session_ref = self.client.collection('sessions').document(session_data.session_id)
+            session_ref.set(session_dict, merge=True)
+            
+            # Also save to user-specific subcollection for easy user-based queries
+            if session_data.user_id:
+                user_session_ref = (self.client
+                                  .collection('users')
+                                  .document(session_data.user_id)
+                                  .collection('sessions')
+                                  .document(session_data.session_id))
+                user_session_ref.set(session_dict, merge=True)
+                
+                # Update user metadata
+                user_ref = self.client.collection('users').document(session_data.user_id)
+                user_doc = user_ref.get()
+                user_ref.set({
+                    'user_id': session_data.user_id,
+                    'last_session_id': session_data.session_id,
+                    'last_activity': datetime.utcnow(),
+                    'total_sessions': firestore.Increment(1) if user_doc.exists else 1
+                }, merge=True)
+            
             logger.info(f"Saved session {session_data.session_id}")
             return True
             
@@ -92,6 +122,124 @@ class FirestoreTool(Tool):
         except Exception as e:
             logger.error(f"Error retrieving session {session_id}: {e}")
             return None
+    
+    def get_user_sessions(self, user_id: str, limit: Optional[int] = None, active_only: bool = False) -> List[SessionData]:
+        """
+        Retrieve all sessions for a specific user.
+        
+        Args:
+            user_id: User ID to retrieve sessions for
+            limit: Maximum number of sessions to return (None for all)
+            active_only: If True, only return active sessions
+            
+        Returns:
+            List of SessionData objects
+        """
+        try:
+            query = (self.client
+                    .collection('users')
+                    .document(user_id)
+                    .collection('sessions')
+                    .order_by('last_activity', direction=firestore.Query.DESCENDING))
+            
+            if active_only:
+                query = query.where('is_active', '==', True)
+            
+            if limit:
+                query = query.limit(limit)
+            
+            docs = query.stream()
+            sessions = []
+            
+            for doc in docs:
+                if doc.exists:
+                    data = doc.to_dict()
+                    sessions.append(SessionData(**data))
+            
+            logger.info(f"Retrieved {len(sessions)} sessions for user {user_id}")
+            return sessions
+            
+        except Exception as e:
+            logger.error(f"Error retrieving sessions for user {user_id}: {e}")
+            return []
+    
+    def get_user_latest_session(self, user_id: str) -> Optional[SessionData]:
+        """
+        Get the most recent session for a user.
+        
+        Args:
+            user_id: User ID to get latest session for
+            
+        Returns:
+            SessionData object or None if not found
+        """
+        sessions = self.get_user_sessions(user_id, limit=1)
+        return sessions[0] if sessions else None
+    
+    def get_user_active_sessions(self, user_id: str) -> List[SessionData]:
+        """
+        Get all active sessions for a user.
+        
+        Args:
+            user_id: User ID to get active sessions for
+            
+        Returns:
+            List of active SessionData objects
+        """
+        return self.get_user_sessions(user_id, active_only=True)
+    
+    def get_user_info(self, user_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Get user metadata including session statistics.
+        
+        Args:
+            user_id: User ID to get info for
+            
+        Returns:
+            Dictionary with user info or None if not found
+        """
+        try:
+            user_ref = self.client.collection('users').document(user_id)
+            doc = user_ref.get()
+            
+            if doc.exists:
+                return doc.to_dict()
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error retrieving user info for {user_id}: {e}")
+            return None
+    
+    def delete_user_session(self, user_id: str, session_id: str) -> bool:
+        """
+        Delete a specific session for a user.
+        
+        Args:
+            user_id: User ID
+            session_id: Session ID to delete
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            # Delete from main sessions collection
+            self.client.collection('sessions').document(session_id).delete()
+            
+            # Delete from user's sessions subcollection
+            (self.client
+             .collection('users')
+             .document(user_id)
+             .collection('sessions')
+             .document(session_id)
+             .delete())
+            
+            logger.info(f"Deleted session {session_id} for user {user_id}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Error deleting session {session_id} for user {user_id}: {e}")
+            return False
     
     def save_itinerary(self, itinerary: Itinerary) -> bool:
         """
