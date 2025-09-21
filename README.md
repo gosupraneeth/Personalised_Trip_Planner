@@ -51,7 +51,11 @@ This application implements a multi-agent architecture with the following compon
    ```bash
    python -m venv venv
    source venv/bin/activate  # On Windows: venv\Scripts\activate
-   pip install -r requirements.txt
+   # Core dependencies only
+    pip install -r requirements.txt
+
+    # With development tools
+    pip install -r requirements.txt -r requirements-dev.txt
    ```
 
 3. **Configure environment variables**
