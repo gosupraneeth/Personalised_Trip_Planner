@@ -1,76 +1,74 @@
-# Google Cloud and ADK dependencies
-google-adk>=0.1.0
-google-cloud-aiplatform>=1.38.0
-google-cloud-bigquery>=3.11.4
-google-cloud-firestore>=2.11.1
-google-generativeai>=0.3.0
-vertexai>=1.38.0
+# Core Google ADK and AI Platform dependencies
+google-adk==1.14.1
+google-cloud-aiplatform==1.115.0
+google-genai==1.38.0
+
+# Google Cloud Services
+google-cloud-bigquery==3.38.0
+google-cloud-firestore==2.21.0
+google-cloud-storage==2.19.0
+google-cloud-core==2.4.3
+google-api-core==2.25.1
+google-auth==2.40.3
+googleapis-common-protos==1.70.0
 
 # Maps and Location APIs
-googlemaps>=4.10.0
+googlemaps==4.10.0
 
-# Weather API
-requests>=2.31.0
+# HTTP requests and API clients
+requests==2.32.5
+aiohttp==3.12.15
+httpx==0.28.1
 
 # Payment processing
-stripe>=7.0.0
+stripe==12.5.1
 
 # Data validation and modeling
-pydantic>=2.4.0
+pydantic==2.11.9
+pydantic_core==2.33.2
+
+# Web framework and server
+fastapi==0.117.1
+uvicorn==0.36.0
+starlette==0.48.0
+python-multipart==0.0.20
 
 # Type hints and utilities
-typing-extensions>=4.8.0
+typing-extensions==4.15.0
+annotated-types==0.7.0
 
 # Date and time handling
-python-dateutil>=2.8.2
+python-dateutil==2.9.0.post0
 
-# Math and optimization
-numpy>=1.24.0
-scipy>=1.11.0
+# Math and scientific computing
+numpy==2.0.2
+scipy==1.13.1
 
 # Async support
-asyncio
-aiohttp>=3.8.0
+anyio==4.10.0
+asyncio==4.0.0
 
 # Environment and configuration
-python-dotenv>=1.0.0
+python-dotenv==1.1.1
+PyYAML==6.0.2
 
-# Logging and monitoring
-structlog>=23.1.0
+# Database and ORM
+SQLAlchemy==2.0.43
 
 # Testing dependencies
-pytest>=7.4.0
-pytest-asyncio>=0.21.0
-pytest-mock>=3.11.0
+pytest==8.4.2
+pytest-asyncio==1.2.0
+pytest-mock==3.15.1
 
-# Development dependencies
-black>=23.0.0
-flake8>=6.0.0
-mypy>=1.5.0
+# Cryptography and security
+cryptography==46.0.1
+Authlib==1.6.4
 
-# Web server for local testing
-uvicorn>=0.23.0
-fastapi>=0.103.0
+# Utility libraries
+click==8.1.8
+tenacity==8.5.0
+packaging==25.0
+certifi==2025.8.3
 
-# Documentation
-mkdocs>=1.5.0
-mkdocs-material>=9.2.0
-uvicorn>=0.23.0
-pydantic>=2.0.0
-python-multipart>=0.0.6
-
-# Data processing
-pandas>=2.0.0
-numpy>=1.24.0
-
-# Testing
-pytest>=7.4.0
-pytest-asyncio>=0.21.0
-httpx>=0.24.0
-
-# Environment and configuration
-python-dotenv>=1.0.0
-pyyaml>=6.0
-
-# Logging and monitoring
-structlog>=23.1.0
+# Development and debugging
+watchdog==6.0.0
