@@ -75,33 +75,41 @@ class OrchestratorAgent(LlmAgent):
             if not session_id:
                 session_id = str(uuid.uuid4())
             
-            # Initialize session data
-            session_data = SessionData(
-                session_id=session_id,
-                user_id=user_id,
-                conversation_history=[{
-                    "timestamp": datetime.utcnow().isoformat(),
-                    "user_input": user_input,
-                    "agent": "user"
-                }]
+            # Try to retrieve existing session data or create new one
+            session_data = self._get_or_create_session_data(
+                session_id, user_id, user_input, tools
             )
             
             # Step 1: Analyze user intent and extract trip requirements
             logger.info(f"Step 1: Analyzing user intent for session {session_id}")
+            
+            # Get accumulated context from previous conversation
+            accumulated_context = self._build_accumulated_context(session_data)
+            
             intent_response = self.user_intent_agent.analyze_user_input(
                 user_input, 
-                context=session_data.agent_context
+                context=accumulated_context
             )
             
             if not intent_response.success:
                 return self._create_error_response("Failed to understand trip requirements", intent_response.error)
             
-            # Validate and create trip request
-            trip_data = intent_response.data
+            # Merge new trip data with existing partial data (if any)
+            trip_data = self._merge_trip_data(session_data, intent_response.data)
+            
+            # Validate merged trip requirements
             validation = self.user_intent_agent.validate_trip_requirements(trip_data)
             
+            # Update session data with accumulated trip information
+            session_data.agent_context['partial_trip_data'] = trip_data
+            session_data.agent_context['validation_status'] = validation
+            
             if not validation["is_complete"]:
-                # Generate clarifying questions
+                # Save session data with partial trip information
+                if tools and "firestore" in tools:
+                    tools["firestore"].save_session(session_data)
+                
+                # Generate clarifying questions based on what's still missing
                 questions = self.user_intent_agent.generate_clarifying_questions(trip_data)
                 
                 return AgentResponse(
@@ -110,7 +118,9 @@ class OrchestratorAgent(LlmAgent):
                     data={
                         "clarifying_questions": questions,
                         "partial_data": trip_data,
-                        "missing_fields": validation["missing_required"]
+                        "missing_fields": validation["missing_required"],
+                        "session_id": session_id,
+                        "conversation_count": len(session_data.conversation_history)
                     },
                     message="Need more information to create your trip plan",
                     error="Incomplete trip requirements"
@@ -546,6 +556,85 @@ Provide insights in JSON format:
             message=message,
             error=error
         )
+    
+    def _get_or_create_session_data(
+        self, 
+        session_id: str, 
+        user_id: Optional[str], 
+        user_input: str, 
+        tools: Optional[Dict[str, Any]]
+    ) -> SessionData:
+        """Get existing session data or create new one."""
+        existing_session = None
+        
+        # Try to retrieve existing session data
+        if tools and "firestore" in tools:
+            try:
+                existing_session = tools["firestore"].get_session(session_id)
+            except Exception as e:
+                logger.warning(f"Could not retrieve existing session {session_id}: {e}")
+        
+        if existing_session:
+            # Add current user input to conversation history
+            existing_session.conversation_history.append({
+                "timestamp": datetime.utcnow().isoformat(),
+                "user_input": user_input,
+                "agent": "user"
+            })
+            
+            # Update last activity
+            existing_session.last_activity = datetime.utcnow()
+            
+            logger.info(f"Retrieved existing session {session_id} with {len(existing_session.conversation_history)} messages")
+            return existing_session
+        else:
+            # Create new session data
+            logger.info(f"Creating new session data for {session_id}")
+            return SessionData(
+                session_id=session_id,
+                user_id=user_id,
+                conversation_history=[{
+                    "timestamp": datetime.utcnow().isoformat(),
+                    "user_input": user_input,
+                    "agent": "user"
+                }]
+            )
+    
+    def _build_accumulated_context(self, session_data: SessionData) -> Dict[str, Any]:
+        """Build accumulated context from conversation history and partial data."""
+        context = session_data.agent_context.copy()
+        
+        # Add conversation history context
+        if session_data.conversation_history:
+            user_messages = [
+                msg["user_input"] for msg in session_data.conversation_history 
+                if msg.get("agent") == "user"
+            ]
+            context["conversation_history"] = user_messages
+            context["accumulated_user_input"] = " ".join(user_messages)
+        
+        # Include partial trip data if available
+        if "partial_trip_data" in context:
+            logger.info(f"Found partial trip data in context: {context['partial_trip_data']}")
+        
+        return context
+    
+    def _merge_trip_data(self, session_data: SessionData, new_trip_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Merge new trip data with existing partial data."""
+        # Get existing partial data from context
+        existing_data = session_data.agent_context.get("partial_trip_data", {})
+        
+        # Start with existing data
+        merged_data = existing_data.copy()
+        
+        # Update with new data (new data takes precedence)
+        for key, value in new_trip_data.items():
+            if value is not None and value != "":  # Only update if new value is meaningful
+                merged_data[key] = value
+        
+        logger.info(f"Merged trip data: existing fields {list(existing_data.keys())}, new fields {list(new_trip_data.keys())}, merged fields {list(merged_data.keys())}")
+        
+        return merged_data
     
     def get_workflow_status(self, session_id: str, tools: Optional[Dict[str, Any]]) -> AgentResponse:
         """

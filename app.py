@@ -313,9 +313,37 @@ class TripPlannerApp(AdkApp):
                 if agent_response.data and "clarifying_questions" in agent_response.data:
                     # Need more information
                     questions = agent_response.data["clarifying_questions"]
-                    message = "I need a bit more information to create your perfect trip:\n\n"
+                    partial_data = agent_response.data.get("partial_data", {})
+                    conversation_count = agent_response.data.get("conversation_count", 1)
+                    
+                    message = f"💬 Great! I'm building your trip plan (exchange {conversation_count})...\n\n"
+                    
+                    # Show what we already have
+                    if partial_data:
+                        message += "✅ **Information collected so far:**\n"
+                        for key, value in partial_data.items():
+                            if value is not None and value != "":
+                                if key == "destination":
+                                    message += f"📍 Destination: {value}\n"
+                                elif key == "start_date":
+                                    message += f"📅 Start Date: {value}\n"
+                                elif key == "duration_days":
+                                    message += f"⏰ Duration: {value} days\n"
+                                elif key == "number_of_travelers":
+                                    message += f"👥 Travelers: {value}\n"
+                                elif key == "budget_range":
+                                    message += f"💰 Budget: {value}\n"
+                                elif key == "group_type":
+                                    message += f"👨‍👩‍👧‍👦 Group Type: {value}\n"
+                                elif key == "interests":
+                                    message += f"🎯 Interests: {', '.join(value) if isinstance(value, list) else value}\n"
+                        message += "\n"
+                    
+                    message += "❓ **I need a bit more information:**\n"
                     for i, question in enumerate(questions, 1):
                         message += f"{i}. {question}\n"
+                    
+                    message += "\n💡 *Just answer any of the questions above - I'll keep track of everything!*"
                     return message
                 else:
                     return f"❌ {agent_response.message or 'Something went wrong'}"
@@ -337,7 +365,11 @@ class TripPlannerApp(AdkApp):
                 for day in itinerary['days']:
                     message += f"**Day {day['day']}** ({len(day['items'])} activities, ${day['total_estimated_cost']:.2f})\n"
                     for item in day['items'][:3]:  # Show first 3 activities
-                        message += f"  • {item['title']} ({item['start_time']} - {item['end_time']})\n"
+                        # Handle both direct POI access and nested POI structure
+                        poi_name = item.get('poi', {}).get('name') or item.get('name', 'Activity')
+                        start_time = item.get('start_time', item.get('time_slot', '').split('-')[0] if item.get('time_slot') else 'TBD')
+                        end_time = item.get('end_time', item.get('time_slot', '').split('-')[-1] if item.get('time_slot') else 'TBD')
+                        message += f"  • {poi_name} ({start_time} - {end_time})\n"
                     if len(day['items']) > 3:
                         message += f"  • ... and {len(day['items']) - 3} more activities\n"
                     message += "\n"

@@ -90,11 +90,23 @@ class UserIntentAgent(LlmAgent):
         """
         try:
             # Validate required fields
-            required_fields = ['destination', 'start_date', 'end_date', 'number_of_travelers']
+            required_fields = ['destination', 'start_date', 'number_of_travelers']
             for field in required_fields:
                 if field not in intent_data or not intent_data[field]:
                     logger.warning(f"Missing required field: {field}")
                     return None
+            
+            # Handle end_date calculation from duration if needed
+            end_date = intent_data.get('end_date')
+            if not end_date and intent_data.get('duration_days'):
+                from datetime import datetime, timedelta
+                start_date = datetime.fromisoformat(intent_data['start_date'])
+                end_date = (start_date + timedelta(days=intent_data['duration_days'])).isoformat()[:10]
+                logger.info(f"Calculated end_date {end_date} from duration {intent_data['duration_days']} days")
+            
+            if not end_date:
+                logger.warning("Missing end_date and duration_days")
+                return None
             
             # Map group type
             group_type = GroupType.SOLO
@@ -109,7 +121,7 @@ class UserIntentAgent(LlmAgent):
             trip_request = TripRequest(
                 destination=intent_data['destination'],
                 start_date=intent_data['start_date'],
-                end_date=intent_data['end_date'],
+                end_date=end_date,
                 number_of_travelers=intent_data['number_of_travelers'],
                 group_type=group_type,
                 budget_range=budget_range,
@@ -130,30 +142,57 @@ class UserIntentAgent(LlmAgent):
     
     def _create_intent_analysis_prompt(self, user_input: str, context: Optional[Dict[str, Any]]) -> str:
         """Create a prompt for intent analysis."""
+        
+        # Build context information
+        context_info = "No previous context"
+        if context:
+            context_parts = []
+            
+            # Include conversation history if available
+            if "conversation_history" in context:
+                user_messages = context["conversation_history"]
+                context_parts.append(f"Previous user messages: {' | '.join(user_messages)}")
+            
+            if "accumulated_user_input" in context:
+                context_parts.append(f"Accumulated input: {context['accumulated_user_input']}")
+            
+            # Include partial trip data if available
+            if "partial_trip_data" in context:
+                partial = context["partial_trip_data"]
+                if partial:
+                    context_parts.append(f"Already collected: {partial}")
+            
+            if context_parts:
+                context_info = " | ".join(context_parts)
+        
         prompt = f"""
-You are an AI travel planning assistant. Analyze the following user input and extract trip planning information.
+You are an AI travel planning assistant. Analyze the current user input along with any previous conversation context to extract comprehensive trip planning information.
 
-User Input: "{user_input}"
+Current User Input: "{user_input}"
 
-Context: {context or "No previous context"}
+Previous Context: {context_info}
 
-Extract the following information if available:
+IMPORTANT: When analyzing the input, consider BOTH the current message AND the previous context. Combine information from all sources to build a complete picture.
+
+Extract the following information if available (combine current input with previous context):
 1. Destination (city, country, or region)
 2. Start date (YYYY-MM-DD format)
-3. End date (YYYY-MM-DD format)
-4. Number of travelers (integer)
-5. Group type (solo, family, friends, couple, business)
-6. Budget range (budget, moderate, luxury, premium)
-7. Budget amount (specific dollar amount if mentioned)
-8. Special interests (list of activities, attractions, or preferences)
-9. Accessibility needs (any mentioned accessibility requirements)
-10. Dietary restrictions (any food allergies or dietary preferences)
+3. End date (YYYY-MM-DD format) - can be calculated from start_date + duration
+4. Duration (number of days if mentioned separately)
+5. Number of travelers (integer)
+6. Group type (solo, family, friends, couple, business)
+7. Budget range (budget, moderate, luxury, premium)
+8. Budget amount (specific dollar amount if mentioned)
+9. Special interests (list of activities, attractions, or preferences)
+10. Accessibility needs (any mentioned accessibility requirements)
+11. Dietary restrictions (any food allergies or dietary preferences)
 
 Return the information in this exact JSON format:
 {{
     "destination": "string or null",
     "start_date": "YYYY-MM-DD or null",
-    "end_date": "YYYY-MM-DD or null", 
+    "end_date": "YYYY-MM-DD or null",
+    "duration_days": number or null,
     "number_of_travelers": number or null,
     "group_type": "solo/family/friends/couple/business or null",
     "budget_range": "budget/moderate/luxury/premium or null",
@@ -166,7 +205,12 @@ Return the information in this exact JSON format:
     "clarifying_questions": ["list", "of", "questions", "to", "ask", "user"]
 }}
 
-Be thorough in extracting information but conservative in assumptions. If information is unclear or missing, note it in the missing_info and clarifying_questions fields.
+Examples of combining information:
+- If previous context has "Paris" and current input says "3 days", combine them
+- If previous context has "I want to go to Italy" and current input says "2 people", both should be extracted
+- If previous context has partial budget info and current input clarifies, use the most recent/complete information
+
+Be thorough in extracting information and smart about combining current input with previous context. Only mark information as missing if it's truly not available from either source.
 """
         return prompt
     
@@ -232,10 +276,23 @@ Be thorough in extracting information but conservative in assumptions. If inform
         # Check required fields
         required_fields = {
             "destination": "Where would you like to travel?",
-            "start_date": "When would you like to start your trip?",
-            "end_date": "When would you like to end your trip?",
             "number_of_travelers": "How many people will be traveling?"
         }
+        
+        # Check for date information (either start_date + end_date OR start_date + duration_days)
+        has_start_date = bool(trip_data.get("start_date"))
+        has_end_date = bool(trip_data.get("end_date"))
+        has_duration = bool(trip_data.get("duration_days"))
+        
+        if not has_start_date:
+            validation_result["missing_required"].append("start_date")
+            validation_result["suggestions"].append("When would you like to start your trip?")
+            validation_result["is_complete"] = False
+        
+        if not has_end_date and not has_duration:
+            validation_result["missing_required"].append("end_date_or_duration")
+            validation_result["suggestions"].append("When would you like to end your trip, or how many days would you like to travel?")
+            validation_result["is_complete"] = False
         
         for field, question in required_fields.items():
             if not trip_data.get(field):
