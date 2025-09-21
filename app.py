@@ -77,7 +77,7 @@ class TripPlannerApp(AdkApp):
             
             # API Keys
             "google_maps_api_key": os.getenv("GOOGLE_MAPS_API_KEY"),
-            "openweather_api_key": os.getenv("OPENWEATHER_API_KEY"),
+            "google_weather_api_key": os.getenv("GOOGLE_WEATHER_API_KEY"),
             "stripe_api_key": os.getenv("STRIPE_API_KEY"),
             
             # BigQuery Configuration
@@ -97,10 +97,10 @@ class TripPlannerApp(AdkApp):
         logger.info(f"  Project ID: {config['project_id']}")
         logger.info(f"  Location: {config['location']}")
         logger.info(f"  Maps API Key: {'***' + config['google_maps_api_key'][-4:] if config['google_maps_api_key'] else 'Not set'}")
-        logger.info(f"  Weather API Key: {'***' + config['openweather_api_key'][-4:] if config['openweather_api_key'] else 'Not set'}")
+        logger.info(f"  Weather API Key: {'***' + config['google_weather_api_key'][-4:] if config['google_weather_api_key'] else 'Not set'}")
         
         # Validate required configuration
-        required_keys = ["google_maps_api_key", "openweather_api_key"]
+        required_keys = ["google_maps_api_key", "google_weather_api_key"]
         missing_keys = [key for key in required_keys if not config.get(key)]
         
         if missing_keys:
@@ -121,8 +121,8 @@ class TripPlannerApp(AdkApp):
                 logger.warning("Maps API tool not initialized - missing API key")
             
             # Weather API Tool
-            if self.config.get("openweather_api_key"):
-                tools["weather"] = WeatherApiTool(self.config["openweather_api_key"])
+            if self.config.get("google_weather_api_key"):
+                tools["weather"] = WeatherApiTool(self.config["google_weather_api_key"])
                 logger.info("Weather API tool initialized")
             else:
                 logger.warning("Weather API tool not initialized - missing API key")

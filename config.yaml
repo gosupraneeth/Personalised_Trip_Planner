@@ -26,8 +26,8 @@ apis:
   google_maps:
     api_key: "${GOOGLE_MAPS_API_KEY}"
   weather:
-    api_key: "${OPENWEATHER_API_KEY}"
-    base_url: "https://api.openweathermap.org/data/2.5"
+    api_key: "${GOOGLE_WEATHER_API_KEY}"
+    provider: "google_vertex_ai"
   
 # Database Configuration
 database:
