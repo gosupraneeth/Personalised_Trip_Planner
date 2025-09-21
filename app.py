@@ -77,7 +77,7 @@ class TripPlannerApp(AdkApp):
             
             # API Keys
             "google_maps_api_key": os.getenv("GOOGLE_MAPS_API_KEY"),
-            "openweather_api_key": os.getenv("OPENWEATHER_API_KEY"),
+            "google_weather_api_key": os.getenv("GOOGLE_WEATHER_API_KEY"),
             "stripe_api_key": os.getenv("STRIPE_API_KEY"),
             
             # BigQuery Configuration
@@ -97,10 +97,10 @@ class TripPlannerApp(AdkApp):
         logger.info(f"  Project ID: {config['project_id']}")
         logger.info(f"  Location: {config['location']}")
         logger.info(f"  Maps API Key: {'***' + config['google_maps_api_key'][-4:] if config['google_maps_api_key'] else 'Not set'}")
-        logger.info(f"  Weather API Key: {'***' + config['openweather_api_key'][-4:] if config['openweather_api_key'] else 'Not set'}")
+        logger.info(f"  Weather API Key: {'***' + config['google_weather_api_key'][-4:] if config['google_weather_api_key'] else 'Not set'}")
         
         # Validate required configuration
-        required_keys = ["google_maps_api_key", "openweather_api_key"]
+        required_keys = ["google_maps_api_key", "google_weather_api_key"]
         missing_keys = [key for key in required_keys if not config.get(key)]
         
         if missing_keys:
@@ -121,8 +121,8 @@ class TripPlannerApp(AdkApp):
                 logger.warning("Maps API tool not initialized - missing API key")
             
             # Weather API Tool
-            if self.config.get("openweather_api_key"):
-                tools["weather"] = WeatherApiTool(self.config["openweather_api_key"])
+            if self.config.get("google_weather_api_key"):
+                tools["weather"] = WeatherApiTool(self.config["google_weather_api_key"])
                 logger.info("Weather API tool initialized")
             else:
                 logger.warning("Weather API tool not initialized - missing API key")
@@ -360,19 +360,64 @@ class TripPlannerApp(AdkApp):
                 message += f"💰 **Total Estimated Cost:** ${float(itinerary['total_cost']):.2f}\n"
                 message += f"🎯 **Activities:** {sum(len(day['items']) for day in itinerary['days'])}\n\n"
                 
-                # Add daily breakdown
-                message += "📋 **Daily Itinerary:**\n"
+                # Add detailed daily breakdown - SHOW ALL ACTIVITIES
+                message += "📋 **Detailed Daily Itinerary:**\n"
+                message += "=" * 60 + "\n"
+                
                 for day in itinerary['days']:
-                    message += f"**Day {day['day']}** ({len(day['items'])} activities, ${day['total_estimated_cost']:.2f})\n"
-                    for item in day['items'][:3]:  # Show first 3 activities
+                    message += f"\n**🗓️ Day {day['day']}** - {len(day['items'])} activities | 💰 ${day['total_estimated_cost']:.2f}\n"
+                    message += "-" * 50 + "\n"
+                    
+                    # Show ALL activities for the day
+                    for idx, item in enumerate(day['items'], 1):
                         # Handle both direct POI access and nested POI structure
-                        poi_name = item.get('poi', {}).get('name') or item.get('name', 'Activity')
+                        poi_name = item.get('poi', {}).get('name') or item.get('name', f'Activity {idx}')
                         start_time = item.get('start_time', item.get('time_slot', '').split('-')[0] if item.get('time_slot') else 'TBD')
                         end_time = item.get('end_time', item.get('time_slot', '').split('-')[-1] if item.get('time_slot') else 'TBD')
-                        message += f"  • {poi_name} ({start_time} - {end_time})\n"
-                    if len(day['items']) > 3:
-                        message += f"  • ... and {len(day['items']) - 3} more activities\n"
-                    message += "\n"
+                        
+                        # Get activity type or category
+                        activity_type = item.get('activity_type', item.get('poi', {}).get('types', ['Activity'])[0] if item.get('poi', {}).get('types') else 'Activity')
+                        
+                        # Get estimated cost
+                        estimated_cost = item.get('estimated_cost', 0)
+                        cost_display = f"${estimated_cost:.2f}" if estimated_cost > 0 else "Free"
+                        
+                        # Get duration
+                        duration = item.get('duration_hours', item.get('duration', 'N/A'))
+                        duration_display = f"{duration}h" if isinstance(duration, (int, float)) else duration
+                        
+                        # Format the activity line
+                        message += f"  {idx:2d}. 🏛️ **{poi_name}**\n"
+                        message += f"      ⏰ {start_time} - {end_time} ({duration_display})\n"
+                        message += f"      💰 {cost_display} | 🏷️ {activity_type}\n"
+                        
+                        # Add description if available
+                        description = item.get('description', item.get('poi', {}).get('description', ''))
+                        if description and len(description) > 0:
+                            # Truncate long descriptions
+                            desc_preview = description[:100] + "..." if len(description) > 100 else description
+                            message += f"      📝 {desc_preview}\n"
+                        
+                        # Add location if available
+                        location = item.get('location', item.get('poi', {}).get('formatted_address', ''))
+                        if location:
+                            message += f"      📍 {location}\n"
+                        
+                        message += "\n"
+                
+                # Add travel summary
+                message += "\n" + "=" * 60 + "\n"
+                message += "🚗 **Travel Information:**\n"
+                
+                total_distance = sum(day.get('total_distance_km', 0) for day in itinerary['days'])
+                total_travel_time = sum(day.get('total_travel_time_minutes', 0) for day in itinerary['days'])
+                
+                if total_distance > 0:
+                    message += f"📏 Total Distance: {total_distance:.1f} km\n"
+                if total_travel_time > 0:
+                    hours = total_travel_time // 60
+                    minutes = total_travel_time % 60
+                    message += f"⏱️ Total Travel Time: {hours}h {minutes}m\n"
             
             # Add AI insights if available
             if "ai_insights" in data and data["ai_insights"]:

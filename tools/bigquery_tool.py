@@ -6,6 +6,7 @@ reviews, and analytics using Google BigQuery.
 """
 
 import logging
+import json
 from typing import List, Dict, Any, Optional
 from datetime import datetime
 from google.cloud import bigquery
@@ -17,10 +18,161 @@ from schemas import POI, TripRequest
 logger = logging.getLogger(__name__)
 
 
+def serialize_for_bigquery(obj: Any) -> Any:
+    """
+    Convert objects to JSON-serializable format for BigQuery.
+    
+    Args:
+        obj: Object to serialize
+        
+    Returns:
+        JSON-serializable object
+    """
+    if isinstance(obj, datetime):
+        return obj.isoformat()
+    elif isinstance(obj, dict):
+        # Filter out None values for BigQuery JSON fields
+        return {key: serialize_for_bigquery(value) for key, value in obj.items() if value is not None}
+    elif isinstance(obj, list):
+        return [serialize_for_bigquery(item) for item in obj]
+    elif hasattr(obj, 'dict'):  # Pydantic model
+        return serialize_for_bigquery(obj.dict())
+    else:
+        return obj
+
+
+def prepare_address_field(address_obj) -> str:
+    """
+    Prepare address field for BigQuery JSON storage.
+    
+    Args:
+        address_obj: Address object or None
+        
+    Returns:
+        JSON string representation for BigQuery
+    """
+    if not address_obj:
+        result = {
+            "street": None,
+            "city": "",
+            "state": None,
+            "country": "",
+            "postal_code": None,
+            "formatted_address": None
+        }
+    else:
+        address_dict = address_obj.dict() if hasattr(address_obj, 'dict') else address_obj
+        # Ensure required fields exist
+        result = {
+            "street": address_dict.get("street"),
+            "city": address_dict.get("city", ""),
+            "state": address_dict.get("state"),
+            "country": address_dict.get("country", ""),
+            "postal_code": address_dict.get("postal_code"),
+            "formatted_address": address_dict.get("formatted_address")
+        }
+    
+    # Filter out None values and convert to JSON string
+    filtered_result = {k: v for k, v in result.items() if v is not None}
+    return json.dumps(filtered_result)
+
+
+def prepare_opening_hours_field(opening_hours_obj) -> str:
+    """
+    Prepare opening hours field for BigQuery JSON storage.
+    
+    Args:
+        opening_hours_obj: Opening hours object, dict, or None
+        
+    Returns:
+        JSON string representation for BigQuery
+    """
+    logger.info(f"prepare_opening_hours_field input: {opening_hours_obj}, type: {type(opening_hours_obj)}")
+    
+    if not opening_hours_obj:
+        logger.info("Opening hours is empty/None, returning empty JSON object")
+        return "{}"
+    
+    # If it's already a dictionary, use it; otherwise try to convert
+    if isinstance(opening_hours_obj, dict):
+        opening_hours_dict = opening_hours_obj
+        logger.info(f"Opening hours is dict: {opening_hours_dict}")
+    elif hasattr(opening_hours_obj, 'dict'):
+        opening_hours_dict = opening_hours_obj.dict()
+        logger.info(f"Opening hours has .dict() method, converted: {opening_hours_dict}")
+    else:
+        # If it's some other type, convert to string representation
+        logger.info(f"Opening hours is unknown type, converting to string: {opening_hours_obj}")
+        opening_hours_dict = {"raw": str(opening_hours_obj)}
+    
+    # Ensure all values are strings and filter out None values
+    result = {}
+    for key, value in opening_hours_dict.items():
+        if value is not None:
+            result[str(key)] = str(value)
+    
+    # Convert to JSON string for BigQuery
+    json_result = json.dumps(result)
+    logger.info(f"prepare_opening_hours_field output: {json_result}")
+    return json_result
+
+
+def prepare_json_object_field(data) -> str:
+    """
+    Prepare a generic object field for BigQuery JSON storage.
+    
+    Args:
+        data: Data to prepare (dict, object, or None)
+        
+    Returns:
+        JSON string representation for BigQuery
+    """
+    if not data:
+        return "{}"
+    
+    if isinstance(data, dict):
+        # Filter out None values and ensure all values are serializable
+        result = {}
+        for key, value in data.items():
+            if value is not None:
+                result[str(key)] = value
+    elif hasattr(data, 'dict'):
+        temp_dict = data.dict()
+        result = {str(k): v for k, v in temp_dict.items() if v is not None}
+    else:
+        # Convert other types to a basic representation
+        result = {"value": str(data)}
+    
+    return json.dumps(result)
+
+
+def prepare_json_array_field(data) -> str:
+    """
+    Prepare a generic array field for BigQuery JSON storage.
+    
+    Args:
+        data: Data to prepare (list, or None)
+        
+    Returns:
+        JSON string representation for BigQuery
+    """
+    if not data:
+        return "[]"
+    
+    if isinstance(data, list):
+        # Filter out None values
+        result = [item for item in data if item is not None]
+    else:
+        # Convert single item to list
+        result = [data] if data is not None else []
+    
+    return json.dumps(result)
+
+
 class BigQueryTool(Tool):
     """BigQuery tool for caching POI data and analytics."""
     
-    def __init__(self, project_id: str, dataset_id: str, location: str = "US"):
+    def __init__(self, project_id: str, dataset_id: str = "trip_planner", location: str = "US"):
         """Initialize BigQuery tool."""
         super().__init__("bigquery_tool", "BigQuery data caching and analytics tool")
         self.project_id = project_id
@@ -36,6 +188,11 @@ class BigQueryTool(Tool):
         except Exception as e:
             logger.error(f"Failed to initialize BigQuery client: {e}")
     
+    @property
+    def dataset_ref(self):
+        """Get dataset reference."""
+        return f"{self.project_id}.{self.dataset_id}"
+    
     def execute(self, operation: str, **kwargs) -> Any:
         """Execute BigQuery operations."""
         if operation == "cache_poi":
@@ -47,17 +204,43 @@ class BigQueryTool(Tool):
         else:
             raise ValueError(f"Unknown operation: {operation}")
     
+    def _ensure_dataset_exists(self):
+        """Ensure the dataset exists, create if it doesn't."""
+        try:
+            dataset_ref = bigquery.DatasetReference(self.project_id, self.dataset_id)
+            self.client.get_dataset(dataset_ref)
+            logger.info(f"Dataset {self.dataset_id} already exists")
+        except NotFound:
+            dataset = bigquery.Dataset(dataset_ref)
+            dataset.location = self.location
+            self.client.create_dataset(dataset)
+            logger.info(f"Created dataset {self.dataset_id}")
+        except Exception as e:
+            logger.error(f"Error ensuring dataset exists: {e}")
+    
+    def _ensure_tables_exist(self):
+        """Ensure all required tables exist."""
+        try:
+            self._create_pois_table()
+            self._create_reviews_table()
+            self._create_search_cache_table()
+            self._create_trip_analytics_table()
+            logger.info("All BigQuery tables ensured")
+        except Exception as e:
+            logger.error(f"Error ensuring tables exist: {e}")
+    
     def _initialize_tables(self):
         """Initialize BigQuery tables if they don't exist."""
         try:
             # Check if dataset exists, create if not
             try:
-                self.client.get_dataset(self.dataset_ref)
+                dataset_ref = bigquery.DatasetReference(self.project_id, self.dataset_id)
+                self.client.get_dataset(dataset_ref)
             except NotFound:
-                dataset = bigquery.Dataset(self.dataset_ref)
+                dataset = bigquery.Dataset(dataset_ref)
                 dataset.location = "US"
                 self.client.create_dataset(dataset)
-                logger.info(f"Created dataset {self.dataset}")
+                logger.info(f"Created dataset {self.dataset_id}")
             
             # Define table schemas
             self._create_pois_table()
@@ -70,7 +253,7 @@ class BigQueryTool(Tool):
     
     def _create_pois_table(self):
         """Create the POIs table if it doesn't exist."""
-        table_id = f"{self.project_id}.{self.dataset}.pois"
+        table_id = f"{self.project_id}.{self.dataset_id}.pois"
         
         schema = [
             bigquery.SchemaField("poi_id", "STRING", mode="REQUIRED"),
@@ -100,7 +283,7 @@ class BigQueryTool(Tool):
     
     def _create_reviews_table(self):
         """Create the reviews table if it doesn't exist."""
-        table_id = f"{self.project_id}.{self.dataset}.reviews"
+        table_id = f"{self.project_id}.{self.dataset_id}.reviews"
         
         schema = [
             bigquery.SchemaField("review_id", "STRING", mode="REQUIRED"),
@@ -117,7 +300,7 @@ class BigQueryTool(Tool):
     
     def _create_search_cache_table(self):
         """Create the search cache table if it doesn't exist."""
-        table_id = f"{self.project_id}.{self.dataset}.search_cache"
+        table_id = f"{self.project_id}.{self.dataset_id}.search_cache"
         
         schema = [
             bigquery.SchemaField("cache_key", "STRING", mode="REQUIRED"),
@@ -132,7 +315,7 @@ class BigQueryTool(Tool):
     
     def _create_trip_analytics_table(self):
         """Create the trip analytics table if it doesn't exist."""
-        table_id = f"{self.project_id}.{self.dataset}.trip_analytics"
+        table_id = f"{self.project_id}.{self.dataset_id}.trip_analytics"
         
         schema = [
             bigquery.SchemaField("trip_id", "STRING", mode="REQUIRED"),
@@ -169,7 +352,7 @@ class BigQueryTool(Tool):
             True if successful, False otherwise
         """
         try:
-            table_id = f"{self.project_id}.{self.dataset}.pois"
+            table_id = f"{self.project_id}.{self.dataset_id}.pois"
             
             row = {
                 "poi_id": poi.id,
@@ -178,11 +361,11 @@ class BigQueryTool(Tool):
                 "category": poi.category.value,
                 "latitude": poi.coordinates.latitude,
                 "longitude": poi.coordinates.longitude,
-                "address": poi.address.dict(),
+                "address": prepare_address_field(poi.address),
                 "rating": poi.rating,
                 "review_count": poi.review_count,
                 "price_level": poi.price_level,
-                "opening_hours": poi.opening_hours,
+                "opening_hours": prepare_opening_hours_field(poi.opening_hours),
                 "website": poi.website,
                 "phone": poi.phone,
                 "photos": poi.photos,
@@ -195,8 +378,33 @@ class BigQueryTool(Tool):
                 "updated_at": datetime.utcnow()
             }
             
+            # For POI data, JSON fields are already prepared as strings, so we only need to serialize datetime fields
+            serialized_row = {}
+            for key, value in row.items():
+                if key in ['address', 'opening_hours']:
+                    # These are already JSON strings, don't re-serialize
+                    serialized_row[key] = value
+                elif isinstance(value, datetime):
+                    # Convert datetime to ISO string
+                    serialized_row[key] = value.isoformat()
+                else:
+                    # Keep other values as-is
+                    serialized_row[key] = value
+            
+            # Debug: Log the address field specifically
+            logger.info(f"Address field before serialization: {row.get('address')}")
+            logger.info(f"Address field after serialization: {serialized_row.get('address')}")
+            logger.info(f"Address field type: {type(serialized_row.get('address'))}")
+            
+            # Debug: Log the opening_hours field specifically
+            logger.info(f"Opening hours field before serialization: {row.get('opening_hours')}")
+            logger.info(f"Opening hours field after serialization: {serialized_row.get('opening_hours')}")
+            logger.info(f"Opening hours field type: {type(serialized_row.get('opening_hours'))}")
+            logger.info(f"Original POI opening_hours: {poi.opening_hours}")
+            logger.info(f"Original POI opening_hours type: {type(poi.opening_hours)}")
+            
             table = self.client.get_table(table_id)
-            errors = self.client.insert_rows_json(table, [row])
+            errors = self.client.insert_rows_json(table, [serialized_row])
             
             if errors:
                 logger.error(f"Error caching POI {poi.id}: {errors}")
@@ -233,7 +441,7 @@ class BigQueryTool(Tool):
             
             query = f"""
             SELECT *
-            FROM `{self.project_id}.{self.dataset}.pois`
+            FROM `{self.project_id}.{self.dataset_id}.pois`
             WHERE ST_DWITHIN(
                 ST_GEOGPOINT(longitude, latitude),
                 ST_GEOGPOINT({lng}, {lat}),
@@ -281,8 +489,8 @@ class BigQueryTool(Tool):
         try:
             query = f"""
             SELECT *,
-                   (rating * LOG(review_count + 1)) as popularity_score
-            FROM `{self.project_id}.{self.dataset}.pois`
+                   (rating * LOG(review_count + 1)) as calculated_popularity_score
+            FROM `{self.project_id}.{self.dataset_id}.pois`
             WHERE LOWER(JSON_EXTRACT_SCALAR(address, '$.city')) LIKE '%{destination.lower()}%'
                OR LOWER(JSON_EXTRACT_SCALAR(address, '$.formatted_address')) LIKE '%{destination.lower()}%'
             """
@@ -291,7 +499,7 @@ class BigQueryTool(Tool):
                 query += f" AND category = '{category}'"
             
             query += f"""
-            ORDER BY popularity_score DESC
+            ORDER BY calculated_popularity_score DESC
             LIMIT {limit}
             """
             
@@ -332,7 +540,7 @@ class BigQueryTool(Tool):
             True if successful, False otherwise
         """
         try:
-            table_id = f"{self.project_id}.{self.dataset}.search_cache"
+            table_id = f"{self.project_id}.{self.dataset_id}.search_cache"
             
             expires_at = datetime.utcnow().replace(microsecond=0)
             expires_at = expires_at.replace(hour=expires_at.hour + ttl_hours)
@@ -340,14 +548,27 @@ class BigQueryTool(Tool):
             row = {
                 "cache_key": cache_key,
                 "location": location,
-                "search_params": search_params,
-                "results": results,
+                "search_params": prepare_json_object_field(search_params),
+                "results": prepare_json_array_field(results),
                 "created_at": datetime.utcnow(),
                 "expires_at": expires_at
             }
             
+            # For search cache, JSON fields are already prepared as strings, so we only need to serialize datetime fields
+            serialized_row = {}
+            for key, value in row.items():
+                if key in ['search_params', 'results']:
+                    # These are already JSON strings, don't re-serialize
+                    serialized_row[key] = value
+                elif isinstance(value, datetime):
+                    # Convert datetime to ISO string
+                    serialized_row[key] = value.isoformat()
+                else:
+                    # Keep other values as-is
+                    serialized_row[key] = value
+            
             table = self.client.get_table(table_id)
-            errors = self.client.insert_rows_json(table, [row])
+            errors = self.client.insert_rows_json(table, [serialized_row])
             
             if errors:
                 logger.error(f"Error caching search results: {errors}")
@@ -373,7 +594,7 @@ class BigQueryTool(Tool):
         try:
             query = f"""
             SELECT results
-            FROM `{self.project_id}.{self.dataset}.search_cache`
+            FROM `{self.project_id}.{self.dataset_id}.search_cache`
             WHERE cache_key = '{cache_key}'
               AND expires_at > CURRENT_TIMESTAMP()
             ORDER BY created_at DESC
@@ -406,7 +627,7 @@ class BigQueryTool(Tool):
             True if successful, False otherwise
         """
         try:
-            table_id = f"{self.project_id}.{self.dataset}.trip_analytics"
+            table_id = f"{self.project_id}.{self.dataset_id}.trip_analytics"
             
             row = {
                 "trip_id": itinerary_data.get("id", ""),
@@ -421,8 +642,11 @@ class BigQueryTool(Tool):
                 "created_at": datetime.utcnow()
             }
             
+            # Serialize all data to ensure JSON compatibility
+            serialized_row = serialize_for_bigquery(row)
+            
             table = self.client.get_table(table_id)
-            errors = self.client.insert_rows_json(table, [row])
+            errors = self.client.insert_rows_json(table, [serialized_row])
             
             if errors:
                 logger.error(f"Error logging trip analytics: {errors}")
@@ -454,7 +678,7 @@ class BigQueryTool(Tool):
                 group_type,
                 budget_range,
                 COUNT(*) as count
-            FROM `{self.project_id}.{self.dataset}.trip_analytics`
+            FROM `{self.project_id}.{self.dataset_id}.trip_analytics`
             WHERE LOWER(destination) LIKE '%{destination.lower()}%'
             GROUP BY group_type, budget_range
             ORDER BY count DESC

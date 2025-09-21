@@ -174,18 +174,30 @@ Previous Context: {context_info}
 
 IMPORTANT: When analyzing the input, consider BOTH the current message AND the previous context. Combine information from all sources to build a complete picture.
 
-Extract the following information if available (combine current input with previous context):
+MANDATORY FIELDS (only ask for these if truly missing):
 1. Destination (city, country, or region)
 2. Start date (YYYY-MM-DD format)
-3. End date (YYYY-MM-DD format) - can be calculated from start_date + duration
-4. Duration (number of days if mentioned separately)
-5. Number of travelers (integer)
-6. Group type (solo, family, friends, couple, business)
-7. Budget range (budget, moderate, luxury, premium)
-8. Budget amount (specific dollar amount if mentioned)
-9. Special interests (list of activities, attractions, or preferences)
-10. Accessibility needs (any mentioned accessibility requirements)
-11. Dietary restrictions (any food allergies or dietary preferences)
+3. End date (YYYY-MM-DD format) OR Duration (number of days)
+4. Number of travelers (integer)
+
+OPTIONAL FIELDS (extract if mentioned, otherwise use smart defaults):
+5. Group type (solo, family, friends, couple, business) - infer from context or number of travelers
+6. Budget range (budget, moderate, luxury, premium) - infer from budget amount or use moderate as default
+7. Budget amount (specific dollar amount if mentioned)
+8. Special interests (list of activities, attractions, or preferences) - extract from any mentions
+9. Accessibility needs (only if specifically mentioned)
+10. Dietary restrictions (only if specifically mentioned)
+
+SMART INFERENCE RULES:
+- If 1 traveler and no group type mentioned → assume "solo"
+- If 2 travelers and no group type mentioned → assume "couple" 
+- If 3+ travelers and no group type mentioned → assume "friends"
+- If budget amount < $500 per person → "budget"
+- If budget amount $500-2000 per person → "moderate"  
+- If budget amount $2000-5000 per person → "luxury"
+- If budget amount > $5000 per person → "premium"
+- If no budget mentioned → use "moderate" as default
+- Extract interests from any activity mentions (museums, food, nightlife, etc.)
 
 Return the information in this exact JSON format:
 {{
@@ -194,23 +206,25 @@ Return the information in this exact JSON format:
     "end_date": "YYYY-MM-DD or null",
     "duration_days": number or null,
     "number_of_travelers": number or null,
-    "group_type": "solo/family/friends/couple/business or null",
-    "budget_range": "budget/moderate/luxury/premium or null",
+    "group_type": "solo/family/friends/couple/business or inferred value",
+    "budget_range": "budget/moderate/luxury/premium or inferred value",
     "budget_amount": number or null,
-    "special_interests": ["list", "of", "interests"],
-    "accessibility_needs": ["list", "of", "needs"],
-    "dietary_restrictions": ["list", "of", "restrictions"],
+    "special_interests": ["list", "of", "interests", "extracted", "from", "input"],
+    "accessibility_needs": ["list", "only", "if", "mentioned"],
+    "dietary_restrictions": ["list", "only", "if", "mentioned"],
     "confidence": number between 0 and 1,
-    "missing_info": ["list", "of", "missing", "required", "fields"],
-    "clarifying_questions": ["list", "of", "questions", "to", "ask", "user"]
+    "missing_info": ["list", "of", "missing", "MANDATORY", "fields", "only"],
+    "clarifying_questions": ["questions", "only", "for", "missing", "mandatory", "fields"]
 }}
+
+CRITICAL: Only include fields in missing_info and clarifying_questions if they are MANDATORY fields that are truly missing. Do not ask for optional details like group_type, budget_range, special_interests, etc. - infer these intelligently or use defaults.
 
 Examples of combining information:
 - If previous context has "Paris" and current input says "3 days", combine them
 - If previous context has "I want to go to Italy" and current input says "2 people", both should be extracted
-- If previous context has partial budget info and current input clarifies, use the most recent/complete information
-
-Be thorough in extracting information and smart about combining current input with previous context. Only mark information as missing if it's truly not available from either source.
+- If user says "with friends" → set group_type to "friends"
+- If user mentions "art museums" → add "art" and "museums" to special_interests
+- If user says "$2000 budget" → set budget_amount and infer budget_range as "moderate"
 """
         return prompt
     
@@ -349,28 +363,22 @@ Be thorough in extracting information and smart about combining current input wi
     
     def generate_clarifying_questions(self, trip_data: Dict[str, Any]) -> List[str]:
         """
-        Generate clarifying questions based on incomplete or ambiguous data.
+        Generate clarifying questions based on missing mandatory fields only.
         
         Args:
             trip_data: Extracted trip data
             
         Returns:
-            List of clarifying questions
+            List of clarifying questions for mandatory fields only
         """
         questions = []
         
         validation = self.validate_trip_requirements(trip_data)
         
-        # Add questions for missing required fields
+        # Only add questions for missing MANDATORY fields
         questions.extend(validation["suggestions"])
         
-        # Add specific clarifying questions based on what's available
-        if trip_data.get("destination") and not trip_data.get("special_interests"):
-            questions.append(f"What would you like to do in {trip_data['destination']}? (sightseeing, food, adventure, etc.)")
-        
-        if trip_data.get("group_type") == "family" and not trip_data.get("accessibility_needs"):
-            questions.append("Are there any children or elderly travelers who might need special accommodations?")
-        
+        # Apply smart defaults for optional fields instead of asking
         if trip_data.get("budget_amount") and not trip_data.get("budget_range"):
             budget_amount = trip_data["budget_amount"]
             if budget_amount < 500:
@@ -382,4 +390,14 @@ Be thorough in extracting information and smart about combining current input wi
             else:
                 trip_data["budget_range"] = "premium"
         
-        return questions[:3]  # Limit to 3 most important questions
+        # Apply group type inference if not provided
+        if not trip_data.get("group_type") and trip_data.get("number_of_travelers"):
+            num_travelers = trip_data["number_of_travelers"]
+            if num_travelers == 1:
+                trip_data["group_type"] = "solo"
+            elif num_travelers == 2:
+                trip_data["group_type"] = "couple"
+            else:
+                trip_data["group_type"] = "friends"
+        
+        return questions  # Return only mandatory field questions

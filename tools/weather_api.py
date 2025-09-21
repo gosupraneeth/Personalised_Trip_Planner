@@ -2,13 +2,14 @@
 Weather API tool for the Trip Planner ADK application.
 
 This tool provides weather forecasting and analysis functionality
-using OpenWeatherMap API.
+using mock data based on seasonal patterns and location data.
 """
 
 import logging
 from datetime import date, datetime, timedelta
 from typing import List, Dict, Any, Optional
 import requests
+import random
 from adk import Tool
 
 from schemas import WeatherInfo, WeatherCondition
@@ -17,14 +18,13 @@ logger = logging.getLogger(__name__)
 
 
 class WeatherApiTool(Tool):
-    """OpenWeatherMap API tool for weather forecasts and conditions."""
+    """Mock weather tool that provides realistic weather forecasts based on seasonal patterns."""
     
-    def __init__(self, api_key: str, base_url: str = "http://api.openweathermap.org/data/2.5"):
-        """Initialize the Weather API tool."""
-        super().__init__("weather_api_tool", "OpenWeatherMap API integration for weather data")
+    def __init__(self, api_key: str):
+        """Initialize the Weather API tool with mock data generation."""
+        super().__init__("weather_api_tool", "Mock weather integration for weather data")
         self.api_key = api_key
-        self.base_url = base_url
-        logger.info("Weather API tool initialized")
+        logger.info("Weather API tool initialized with mock data generation")
     
     def execute(self, operation: str, **kwargs) -> Any:
         """Execute Weather API operations."""
@@ -39,7 +39,7 @@ class WeatherApiTool(Tool):
     
     def get_current_weather(self, location: str) -> Optional[Dict[str, Any]]:
         """
-        Get current weather for a location.
+        Get current weather for a location using realistic mock data.
         
         Args:
             location: Location name (e.g., "Tokyo, Japan")
@@ -48,19 +48,9 @@ class WeatherApiTool(Tool):
             Current weather data or None if error
         """
         try:
-            url = f"{self.base_url}/weather"
-            params = {
-                'q': location,
-                'appid': self.api_key,
-                'units': 'metric'
-            }
-            
-            response = requests.get(url, params=params)
-            response.raise_for_status()
-            
-            data = response.json()
+            weather_data = self._generate_realistic_weather(location)
             logger.info(f"Retrieved current weather for {location}")
-            return data
+            return weather_data
             
         except Exception as e:
             logger.error(f"Error getting current weather for {location}: {e}")
@@ -68,7 +58,7 @@ class WeatherApiTool(Tool):
     
     def get_forecast(self, location: str, days: int = 5) -> List[Dict[str, Any]]:
         """
-        Get weather forecast for multiple days.
+        Get weather forecast for multiple days using realistic mock data.
         
         Args:
             location: Location name
@@ -78,28 +68,195 @@ class WeatherApiTool(Tool):
             List of daily weather forecasts
         """
         try:
-            url = f"{self.base_url}/forecast"
-            params = {
-                'q': location,
-                'appid': self.api_key,
-                'units': 'metric'
-            }
+            forecast_data = []
+            current_date = datetime.now().date()
             
-            response = requests.get(url, params=params)
-            response.raise_for_status()
+            for i in range(days):
+                forecast_date = current_date + timedelta(days=i)
+                daily_weather = self._generate_realistic_weather(location, forecast_date)
+                daily_weather['date'] = forecast_date.isoformat()
+                forecast_data.append(daily_weather)
             
-            data = response.json()
-            
-            # Process the 5-day forecast data (3-hour intervals)
-            forecast_list = data.get('list', [])
-            daily_forecasts = self._process_forecast_data(forecast_list, days)
-            
-            logger.info(f"Retrieved {len(daily_forecasts)} days forecast for {location}")
-            return daily_forecasts
+            logger.info(f"Retrieved {len(forecast_data)} days forecast for {location}")
+            return forecast_data
             
         except Exception as e:
             logger.error(f"Error getting forecast for {location}: {e}")
             return []
+    
+    def get_weather_by_coordinates(self, lat: float, lon: float) -> Optional[Dict[str, Any]]:
+        """
+        Get current weather by coordinates using realistic mock data.
+        
+        Args:
+            lat: Latitude
+            lon: Longitude
+            
+        Returns:
+            Current weather data or None if error
+        """
+        try:
+            # Use coordinates to determine general climate zone
+            location_name = self._get_location_name_from_coords(lat, lon)
+            weather_data = self._generate_realistic_weather(location_name)
+            weather_data['coordinates'] = [lat, lon]
+            
+            logger.info(f"Retrieved weather for coordinates {lat}, {lon}")
+            return weather_data
+            
+        except Exception as e:
+            logger.error(f"Error getting weather for coordinates {lat}, {lon}: {e}")
+            return None
+    
+    def _generate_realistic_weather(self, location: str, target_date: date = None) -> Dict[str, Any]:
+        """Generate realistic weather data based on location and season."""
+        if target_date is None:
+            target_date = datetime.now().date()
+        
+        # Determine season based on date (Northern Hemisphere)
+        month = target_date.month
+        if month in [12, 1, 2]:
+            season = "winter"
+        elif month in [3, 4, 5]:
+            season = "spring"
+        elif month in [6, 7, 8]:
+            season = "summer"
+        else:
+            season = "autumn"
+        
+        # Climate zones based on location
+        location_lower = location.lower()
+        climate_zone = self._determine_climate_zone(location_lower)
+        
+        # Generate temperature based on climate and season
+        base_temp, temp_variation = self._get_temperature_range(climate_zone, season)
+        temperature = base_temp + random.uniform(-temp_variation, temp_variation)
+        
+        # Generate weather conditions based on season and climate
+        condition = self._get_realistic_condition(climate_zone, season)
+        
+        # Generate other weather parameters
+        humidity = random.randint(30, 90)
+        wind_speed = random.uniform(5, 25)
+        pressure = random.randint(1000, 1025)
+        precipitation_chance = self._get_precipitation_chance(condition, season)
+        
+        return {
+            "location": location,
+            "temperature": round(temperature, 1),
+            "temperature_high": round(temperature + random.uniform(2, 8), 1),
+            "temperature_low": round(temperature - random.uniform(2, 8), 1),
+            "humidity": humidity,
+            "description": self._get_weather_description(condition),
+            "condition": condition,
+            "wind_speed": round(wind_speed, 1),
+            "pressure": pressure,
+            "precipitation_chance": precipitation_chance
+        }
+    
+    def _determine_climate_zone(self, location: str) -> str:
+        """Determine climate zone based on location."""
+        if any(word in location for word in ['delhi', 'mumbai', 'bangalore', 'chennai', 'hyderabad', 'kolkata', 'india']):
+            return 'tropical'
+        elif any(word in location for word in ['dubai', 'riyadh', 'cairo', 'desert']):
+            return 'desert'
+        elif any(word in location for word in ['london', 'paris', 'berlin', 'europe']):
+            return 'temperate'
+        elif any(word in location for word in ['tokyo', 'seoul', 'beijing']):
+            return 'continental'
+        elif any(word in location for word in ['singapore', 'bangkok', 'kuala lumpur']):
+            return 'equatorial'
+        elif any(word in location for word in ['sydney', 'melbourne', 'australia']):
+            return 'subtropical'
+        else:
+            return 'temperate'  # default
+    
+    def _get_temperature_range(self, climate_zone: str, season: str) -> tuple:
+        """Get base temperature and variation for climate zone and season."""
+        temp_ranges = {
+            'tropical': {
+                'winter': (25, 5), 'spring': (30, 5), 'summer': (35, 5), 'autumn': (28, 5)
+            },
+            'desert': {
+                'winter': (20, 8), 'spring': (30, 10), 'summer': (40, 8), 'autumn': (25, 8)
+            },
+            'temperate': {
+                'winter': (5, 8), 'spring': (15, 8), 'summer': (25, 6), 'autumn': (12, 8)
+            },
+            'continental': {
+                'winter': (-5, 10), 'spring': (12, 8), 'summer': (28, 6), 'autumn': (8, 8)
+            },
+            'equatorial': {
+                'winter': (28, 3), 'spring': (30, 3), 'summer': (32, 3), 'autumn': (29, 3)
+            },
+            'subtropical': {
+                'winter': (15, 6), 'spring': (22, 6), 'summer': (30, 5), 'autumn': (20, 6)
+            }
+        }
+        return temp_ranges.get(climate_zone, temp_ranges['temperate'])[season]
+    
+    def _get_realistic_condition(self, climate_zone: str, season: str) -> str:
+        """Get realistic weather condition based on climate and season."""
+        conditions_by_climate = {
+            'tropical': {
+                'winter': ['sunny', 'cloudy'],
+                'spring': ['sunny', 'cloudy', 'rainy'],
+                'summer': ['rainy', 'stormy', 'cloudy'],
+                'autumn': ['sunny', 'cloudy', 'rainy']
+            },
+            'desert': {
+                'winter': ['sunny', 'cloudy'],
+                'spring': ['sunny', 'cloudy'],
+                'summer': ['sunny', 'sunny', 'sunny'],  # Very sunny
+                'autumn': ['sunny', 'cloudy']
+            },
+            'temperate': {
+                'winter': ['cloudy', 'rainy', 'snowy'],
+                'spring': ['sunny', 'cloudy', 'rainy'],
+                'summer': ['sunny', 'cloudy'],
+                'autumn': ['cloudy', 'rainy', 'foggy']
+            }
+        }
+        
+        default_conditions = ['sunny', 'cloudy', 'rainy']
+        possible_conditions = conditions_by_climate.get(climate_zone, {}).get(season, default_conditions)
+        return random.choice(possible_conditions)
+    
+    def _get_weather_description(self, condition: str) -> str:
+        """Get weather description for condition."""
+        descriptions = {
+            'sunny': 'Clear skies with bright sunshine',
+            'cloudy': 'Partly cloudy with some cloud cover',
+            'rainy': 'Light to moderate rainfall expected',
+            'stormy': 'Thunderstorms with heavy rain',
+            'snowy': 'Snow showers with cold temperatures',
+            'foggy': 'Misty conditions with reduced visibility'
+        }
+        return descriptions.get(condition, 'Mild weather conditions')
+    
+    def _get_precipitation_chance(self, condition: str, season: str) -> int:
+        """Get precipitation chance based on condition."""
+        precipitation_map = {
+            'sunny': 5,
+            'cloudy': 20,
+            'rainy': 80,
+            'stormy': 95,
+            'snowy': 90,
+            'foggy': 30
+        }
+        return precipitation_map.get(condition, 10)
+    
+    def _get_location_name_from_coords(self, lat: float, lon: float) -> str:
+        """Get approximate location name from coordinates."""
+        # Simple mapping based on major cities coordinates
+        if 12 <= lat <= 13 and 77 <= lon <= 78:
+            return "Bangalore, India"
+        elif 28 <= lat <= 29 and 77 <= lon <= 78:
+            return "Delhi, India"
+        elif 19 <= lat <= 19.5 and 72 <= lon <= 73:
+            return "Mumbai, India"
+        else:
+            return f"Location at {lat:.2f}, {lon:.2f}"
     
     def get_weather_for_dates(
         self,
