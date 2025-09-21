@@ -1,0 +1,44 @@
+version: "1.0"
+name: "personalized-trip-planner"
+description: "AI-powered personalized trip planner using Google ADK and Vertex AI"
+
+# ADK Configuration
+adk:
+  agents_dir: "agents"
+  tools_dir: "tools"
+  schemas_dir: "schemas"
+  
+# Vertex AI Configuration
+vertex_ai:
+  project_id: "${GOOGLE_CLOUD_PROJECT}"
+  location: "${VERTEX_AI_LOCATION}"
+  model: "gemini-1.5-pro"
+  
+# Application Configuration
+app:
+  name: "Trip Planner ADK"
+  version: "1.0.0"
+  debug: ${ADK_DEBUG:false}
+  session_timeout: ${SESSION_TIMEOUT:3600}
+
+# External APIs
+apis:
+  google_maps:
+    api_key: "${GOOGLE_MAPS_API_KEY}"
+  weather:
+    api_key: "${OPENWEATHER_API_KEY}"
+    base_url: "https://api.openweathermap.org/data/2.5"
+  
+# Database Configuration
+database:
+  bigquery:
+    project_id: "${GOOGLE_CLOUD_PROJECT}"
+    dataset: "${BIGQUERY_DATASET}"
+  firestore:
+    project_id: "${GOOGLE_CLOUD_PROJECT}"
+
+# Payment Configuration
+payment:
+  stripe:
+    secret_key: "${STRIPE_SECRET_KEY}"
+    publishable_key: "${STRIPE_PUBLISHABLE_KEY}"
