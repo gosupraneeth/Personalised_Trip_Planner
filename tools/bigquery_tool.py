@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 class BigQueryTool(Tool):
     """BigQuery tool for caching POI data and analytics."""
     
-    def __init__(self, project_id: str, dataset_id: str, location: str = "US"):
+    def __init__(self, project_id: str, dataset_id: str = "trip_planner", location: str = "US"):
         """Initialize BigQuery tool."""
         super().__init__("bigquery_tool", "BigQuery data caching and analytics tool")
         self.project_id = project_id
@@ -36,6 +36,11 @@ class BigQueryTool(Tool):
         except Exception as e:
             logger.error(f"Failed to initialize BigQuery client: {e}")
     
+    @property
+    def dataset_ref(self):
+        """Get dataset reference."""
+        return f"{self.project_id}.{self.dataset_id}"
+    
     def execute(self, operation: str, **kwargs) -> Any:
         """Execute BigQuery operations."""
         if operation == "cache_poi":
@@ -47,17 +52,43 @@ class BigQueryTool(Tool):
         else:
             raise ValueError(f"Unknown operation: {operation}")
     
+    def _ensure_dataset_exists(self):
+        """Ensure the dataset exists, create if it doesn't."""
+        try:
+            dataset_ref = bigquery.DatasetReference(self.project_id, self.dataset_id)
+            self.client.get_dataset(dataset_ref)
+            logger.info(f"Dataset {self.dataset_id} already exists")
+        except NotFound:
+            dataset = bigquery.Dataset(dataset_ref)
+            dataset.location = self.location
+            self.client.create_dataset(dataset)
+            logger.info(f"Created dataset {self.dataset_id}")
+        except Exception as e:
+            logger.error(f"Error ensuring dataset exists: {e}")
+    
+    def _ensure_tables_exist(self):
+        """Ensure all required tables exist."""
+        try:
+            self._create_pois_table()
+            self._create_reviews_table()
+            self._create_search_cache_table()
+            self._create_trip_analytics_table()
+            logger.info("All BigQuery tables ensured")
+        except Exception as e:
+            logger.error(f"Error ensuring tables exist: {e}")
+    
     def _initialize_tables(self):
         """Initialize BigQuery tables if they don't exist."""
         try:
             # Check if dataset exists, create if not
             try:
-                self.client.get_dataset(self.dataset_ref)
+                dataset_ref = bigquery.DatasetReference(self.project_id, self.dataset_id)
+                self.client.get_dataset(dataset_ref)
             except NotFound:
-                dataset = bigquery.Dataset(self.dataset_ref)
+                dataset = bigquery.Dataset(dataset_ref)
                 dataset.location = "US"
                 self.client.create_dataset(dataset)
-                logger.info(f"Created dataset {self.dataset}")
+                logger.info(f"Created dataset {self.dataset_id}")
             
             # Define table schemas
             self._create_pois_table()
@@ -70,7 +101,7 @@ class BigQueryTool(Tool):
     
     def _create_pois_table(self):
         """Create the POIs table if it doesn't exist."""
-        table_id = f"{self.project_id}.{self.dataset}.pois"
+        table_id = f"{self.project_id}.{self.dataset_id}.pois"
         
         schema = [
             bigquery.SchemaField("poi_id", "STRING", mode="REQUIRED"),
@@ -100,7 +131,7 @@ class BigQueryTool(Tool):
     
     def _create_reviews_table(self):
         """Create the reviews table if it doesn't exist."""
-        table_id = f"{self.project_id}.{self.dataset}.reviews"
+        table_id = f"{self.project_id}.{self.dataset_id}.reviews"
         
         schema = [
             bigquery.SchemaField("review_id", "STRING", mode="REQUIRED"),
@@ -117,7 +148,7 @@ class BigQueryTool(Tool):
     
     def _create_search_cache_table(self):
         """Create the search cache table if it doesn't exist."""
-        table_id = f"{self.project_id}.{self.dataset}.search_cache"
+        table_id = f"{self.project_id}.{self.dataset_id}.search_cache"
         
         schema = [
             bigquery.SchemaField("cache_key", "STRING", mode="REQUIRED"),
@@ -132,7 +163,7 @@ class BigQueryTool(Tool):
     
     def _create_trip_analytics_table(self):
         """Create the trip analytics table if it doesn't exist."""
-        table_id = f"{self.project_id}.{self.dataset}.trip_analytics"
+        table_id = f"{self.project_id}.{self.dataset_id}.trip_analytics"
         
         schema = [
             bigquery.SchemaField("trip_id", "STRING", mode="REQUIRED"),
@@ -169,7 +200,7 @@ class BigQueryTool(Tool):
             True if successful, False otherwise
         """
         try:
-            table_id = f"{self.project_id}.{self.dataset}.pois"
+            table_id = f"{self.project_id}.{self.dataset_id}.pois"
             
             row = {
                 "poi_id": poi.id,
@@ -233,7 +264,7 @@ class BigQueryTool(Tool):
             
             query = f"""
             SELECT *
-            FROM `{self.project_id}.{self.dataset}.pois`
+            FROM `{self.project_id}.{self.dataset_id}.pois`
             WHERE ST_DWITHIN(
                 ST_GEOGPOINT(longitude, latitude),
                 ST_GEOGPOINT({lng}, {lat}),
@@ -281,8 +312,8 @@ class BigQueryTool(Tool):
         try:
             query = f"""
             SELECT *,
-                   (rating * LOG(review_count + 1)) as popularity_score
-            FROM `{self.project_id}.{self.dataset}.pois`
+                   (rating * LOG(review_count + 1)) as calculated_popularity_score
+            FROM `{self.project_id}.{self.dataset_id}.pois`
             WHERE LOWER(JSON_EXTRACT_SCALAR(address, '$.city')) LIKE '%{destination.lower()}%'
                OR LOWER(JSON_EXTRACT_SCALAR(address, '$.formatted_address')) LIKE '%{destination.lower()}%'
             """
@@ -291,7 +322,7 @@ class BigQueryTool(Tool):
                 query += f" AND category = '{category}'"
             
             query += f"""
-            ORDER BY popularity_score DESC
+            ORDER BY calculated_popularity_score DESC
             LIMIT {limit}
             """
             
@@ -332,7 +363,7 @@ class BigQueryTool(Tool):
             True if successful, False otherwise
         """
         try:
-            table_id = f"{self.project_id}.{self.dataset}.search_cache"
+            table_id = f"{self.project_id}.{self.dataset_id}.search_cache"
             
             expires_at = datetime.utcnow().replace(microsecond=0)
             expires_at = expires_at.replace(hour=expires_at.hour + ttl_hours)
@@ -373,7 +404,7 @@ class BigQueryTool(Tool):
         try:
             query = f"""
             SELECT results
-            FROM `{self.project_id}.{self.dataset}.search_cache`
+            FROM `{self.project_id}.{self.dataset_id}.search_cache`
             WHERE cache_key = '{cache_key}'
               AND expires_at > CURRENT_TIMESTAMP()
             ORDER BY created_at DESC
@@ -406,7 +437,7 @@ class BigQueryTool(Tool):
             True if successful, False otherwise
         """
         try:
-            table_id = f"{self.project_id}.{self.dataset}.trip_analytics"
+            table_id = f"{self.project_id}.{self.dataset_id}.trip_analytics"
             
             row = {
                 "trip_id": itinerary_data.get("id", ""),
@@ -454,7 +485,7 @@ class BigQueryTool(Tool):
                 group_type,
                 budget_range,
                 COUNT(*) as count
-            FROM `{self.project_id}.{self.dataset}.trip_analytics`
+            FROM `{self.project_id}.{self.dataset_id}.trip_analytics`
             WHERE LOWER(destination) LIKE '%{destination.lower()}%'
             GROUP BY group_type, budget_range
             ORDER BY count DESC
